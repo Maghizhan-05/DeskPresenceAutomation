@@ -196,12 +196,97 @@ class PidIdentityTests(SupervisorTestCase):
         self.assertFalse(ws.is_worker_running())
         self.assertEqual(ws.worker_status(), "Stopped")
 
-    def test_identity_record_without_start_time_is_tolerated(self):
+    def test_record_without_start_time_is_rejected_and_never_signalled(self):
+        """Reviewer's blocker: a bare {"pid": N} must not be treated as ours."""
         ws.start_worker()
         worker = ws.load_state()["worker"]
-        ws.save_state(True, {"pid": worker["pid"]})
+        self.assertIsNotNone(worker)
+        assert worker is not None
+        pid = worker["pid"]
+        ws._atomic_write(ws._state_path(), {"enabled": True, "worker": {"pid": pid}})
         self.simulate_menubar_restart()
-        self.assertTrue(ws.is_worker_running())
+        self.assertFalse(ws.is_worker_running())
+        self.assertIsNone(ws.worker_pid())
+        self.assertEqual(ws.worker_status(), "Stopped")
+        self.assertTrue(ws.stop_worker(timeout=0.3))
+        self.assertEqual(self.world.signals, [])      # nothing signalled
+        self.assertTrue(self.world.alive(pid))        # bystander untouched
+
+    def test_unknown_pid_without_start_time_is_never_signalled(self):
+        """Exactly the reproduction reported: {"worker": {"pid": 4242}}."""
+        self.world.procs[4242] = {
+            "start_time": "Mon Oct 19 09:30:00 2026",
+            "comm": "/usr/sbin/unrelated",
+            "ignores_term": False,
+        }
+        ws._atomic_write(ws._state_path(), {"enabled": True, "worker": {"pid": 4242}})
+        self.assertFalse(ws.is_worker_running())
+        self.assertIsNone(ws.worker_pid())
+        self.assertTrue(ws.stop_worker(timeout=0.3))
+        self.assertEqual(self.world.signals, [])
+        self.assertTrue(self.world.alive(4242))
+
+    def test_empty_or_whitespace_start_time_is_rejected(self):
+        for bad in ("", "   ", None, 12345, [], {}):
+            ws._atomic_write(
+                ws._state_path(),
+                {"enabled": True, "worker": {"pid": 4242, "start_time": bad}},
+            )
+            self.assertFalse(
+                ws.is_worker_running(), "start_time=%r must fail closed" % (bad,)
+            )
+            self.assertIsNone(ws.worker_pid())
+
+    def test_invalid_pid_values_are_rejected(self):
+        for bad in (None, 0, -5, "1234", True, 12.5, [], {}):
+            ws._atomic_write(
+                ws._state_path(),
+                {
+                    "enabled": True,
+                    "worker": {"pid": bad, "start_time": "Sun Oct 18 12:00:00 2026"},
+                },
+            )
+            self.assertFalse(
+                ws.is_worker_running(), "pid=%r must fail closed" % (bad,)
+            )
+            self.assertIsNone(ws.worker_pid())
+
+    def test_non_dict_worker_record_does_not_raise(self):
+        for bad in ("a string", 42, ["list"], True):
+            ws._atomic_write(ws._state_path(), {"enabled": True, "worker": bad})
+            self.assertFalse(ws.is_worker_running())
+            self.assertIsNone(ws.worker_pid())
+            self.assertEqual(ws.worker_status(), "Stopped")
+            self.assertTrue(ws.stop_worker(timeout=0.3))
+
+    def test_corrupt_state_file_does_not_raise(self):
+        with open(ws._state_path(), "w") as handle:
+            handle.write("{definitely not json")
+        self.assertFalse(ws.is_worker_running())
+        self.assertIsNone(ws.worker_pid())
+        self.assertEqual(ws.worker_status(), "Stopped")
+
+    def test_discard_invalid_state_clears_malformed_records(self):
+        ws._atomic_write(ws._state_path(), {"enabled": True, "worker": {"pid": 4242}})
+        self.assertTrue(ws.discard_invalid_state())
+        self.assertIsNone(ws.load_state()["worker"])
+        self.assertFalse(ws.load_state()["enabled"])
+
+    def test_discard_invalid_state_keeps_valid_records(self):
+        ws.start_worker()
+        before = ws.load_state()["worker"]
+        self.assertFalse(ws.discard_invalid_state())
+        self.assertEqual(ws.load_state()["worker"], before)
+
+    def test_start_time_mismatch_is_rejected_even_when_pid_is_alive(self):
+        ws.start_worker()
+        worker = dict(ws.load_state()["worker"] or {})
+        worker["start_time"] = "Mon Oct 19 09:30:00 2026"  # wrong
+        ws.save_state(True, worker)
+        self.simulate_menubar_restart()
+        self.assertFalse(ws.is_worker_running())
+        self.assertTrue(ws.stop_worker(timeout=0.3))
+        self.assertEqual(self.world.signals, [])
 
     def test_comm_rewritten_after_exec_does_not_invalidate_identity(self):
         """macOS rewrites `comm` for a venv python shim just after exec.
@@ -298,6 +383,13 @@ class StatusTests(SupervisorTestCase):
         self._beat(True)
         self.assertEqual(ws.worker_status(), "Running (Present)")
 
+    def test_worker_that_hangs_during_startup_grace_is_unresponsive(self):
+        """A stale beat from OUR pid means stuck, not still starting."""
+        ws.start_worker()
+        self._beat(True, age=config.HEARTBEAT_STALE_SECONDS + 2.0)
+        self.assertTrue(ws._within_startup_grace())  # grace is still open
+        self.assertEqual(ws.worker_status(), "Unresponsive")
+
     def test_heartbeat_from_another_pid_is_unresponsive(self):
         ws.start_worker()
         self._age_out_startup_grace()
@@ -310,6 +402,87 @@ class StatusTests(SupervisorTestCase):
         with open(ws._heartbeat_path(), "w") as handle:
             handle.write("{not json")
         self.assertEqual(ws.worker_status(), "Unresponsive")
+
+    def test_heartbeat_without_pid_is_not_rendered_as_live(self):
+        """Reviewer's repro: {"present": true, "ts": now} has no identity."""
+        ws.start_worker()
+        self._age_out_startup_grace()
+        ws._atomic_write(
+            ws._heartbeat_path(), {"present": True, "ts": time.time()}
+        )
+        self.assertEqual(ws.worker_status(), "Unresponsive")
+
+    def test_nonnumeric_ts_does_not_raise(self):
+        ws.start_worker()
+        self._age_out_startup_grace()
+        for bad in ("soon", None, [], {}, True):
+            ws._atomic_write(
+                ws._heartbeat_path(),
+                {"present": True, "pid": ws.worker_pid(), "ts": bad},
+            )
+            self.assertEqual(
+                ws.worker_status(), "Unresponsive", "ts=%r must fail closed" % (bad,)
+            )
+
+    def test_invalid_heartbeat_pid_types_do_not_raise(self):
+        ws.start_worker()
+        self._age_out_startup_grace()
+        for bad in ("1234", 0, -1, None, True, 12.5, []):
+            ws._atomic_write(
+                ws._heartbeat_path(),
+                {"present": True, "pid": bad, "ts": time.time()},
+            )
+            self.assertEqual(ws.worker_status(), "Unresponsive")
+
+    def test_non_dict_heartbeat_does_not_raise(self):
+        ws.start_worker()
+        self._age_out_startup_grace()
+        for bad in ("[]", "42", '"a string"', "[1, 2, 3]"):
+            with open(ws._heartbeat_path(), "w") as handle:
+                handle.write(bad)
+            self.assertEqual(ws.worker_status(), "Unresponsive")
+
+    def test_heartbeat_start_time_mismatch_is_unresponsive(self):
+        ws.start_worker()
+        self._age_out_startup_grace()
+        ws._atomic_write(
+            ws._heartbeat_path(),
+            {
+                "present": True,
+                "pid": ws.worker_pid(),
+                "start_time": "Mon Oct 19 09:30:00 2026",  # not our worker
+                "ts": time.time(),
+            },
+        )
+        self.assertEqual(ws.worker_status(), "Unresponsive")
+
+    def test_matching_heartbeat_start_time_is_live(self):
+        ws.start_worker()
+        worker = ws.load_state()["worker"]
+        assert worker is not None
+        self._age_out_startup_grace()
+        ws._atomic_write(
+            ws._heartbeat_path(),
+            {
+                "present": False,
+                "pid": worker["pid"],
+                "start_time": worker["start_time"],
+                "ts": time.time(),
+            },
+        )
+        self.assertEqual(ws.worker_status(), "Running (Away)")
+
+    def test_status_never_raises_across_a_matrix_of_garbage(self):
+        ws.start_worker()
+        garbage = [
+            "null", "[]", "{}", '{"ts": "x"}', '{"pid": null}',
+            '{"ts": 1, "pid": "a"}', '{"present": true}', "not json at all",
+        ]
+        for payload in garbage:
+            with open(ws._heartbeat_path(), "w") as handle:
+                handle.write(payload)
+            status = ws.worker_status()  # must not raise
+            self.assertIn(status, ("Stopped", "Starting...", "Unresponsive"))
 
     def test_heartbeat_write_is_atomic_and_round_trips(self):
         ws.write_heartbeat("present", True)

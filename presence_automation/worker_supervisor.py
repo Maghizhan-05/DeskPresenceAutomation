@@ -112,16 +112,55 @@ def _read_json(path, default):
     return data
 
 
+def _valid_worker_record(worker):
+    """Return a normalised worker record, or None if the schema is not valid.
+
+    Fail closed: a record missing a usable PID or a nonempty `start_time`
+    cannot prove ownership of anything, so it is rejected outright and is
+    never used to signal a process.
+    """
+    if not isinstance(worker, dict):
+        return None
+    pid = worker.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+    if pid <= 0:
+        return None
+    start_time = worker.get("start_time")
+    if not isinstance(start_time, str) or not start_time.strip():
+        return None
+    started_at = worker.get("started_at")
+    if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
+        started_at = None
+    return {
+        "pid": pid,
+        "start_time": start_time,
+        "comm": worker.get("comm"),
+        "started_at": started_at,
+    }
+
+
 def load_state():
     state = _read_json(_state_path(), {})
-    return {
-        "enabled": bool(state.get("enabled", False)),
-        "worker": state.get("worker") or None,
-    }
+    enabled = state.get("enabled", False)
+    worker = _valid_worker_record(state.get("worker"))
+    return {"enabled": bool(enabled) if not isinstance(enabled, str) else False,
+            "worker": worker}
 
 
 def save_state(enabled, worker=None):
     _atomic_write(_state_path(), {"enabled": bool(enabled), "worker": worker})
+
+
+def discard_invalid_state():
+    """Clear a persisted record that fails schema validation. True if cleared."""
+    raw = _read_json(_state_path(), {})
+    if raw.get("worker") is None:
+        return False
+    if _valid_worker_record(raw.get("worker")) is not None:
+        return False
+    save_state(False, None)
+    return True
 
 
 # --- heartbeat (written by the worker, read by the menu) ---------------------
@@ -149,6 +188,33 @@ def clear_heartbeat():
         pass
 
 
+def _valid_heartbeat(beat):
+    """Normalised heartbeat, or None when the payload cannot be trusted.
+
+    Fail closed: a heartbeat with no numeric `ts`, no usable PID, or a
+    nonstring `start_time` proves nothing about a live worker and must never
+    be rendered as presence.
+    """
+    if not isinstance(beat, dict):
+        return None
+    ts = beat.get("ts")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    pid = beat.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    start_time = beat.get("start_time")
+    if start_time is not None and not isinstance(start_time, str):
+        return None
+    return {
+        "ts": float(ts),
+        "pid": pid,
+        "start_time": start_time,
+        "present": bool(beat.get("present")),
+        "state": beat.get("state"),
+    }
+
+
 def read_heartbeat():
     return _read_json(_heartbeat_path(), None) or None
 
@@ -158,24 +224,29 @@ _CHILD = {"popen": None}  # type: dict
 
 
 def _identity_matches(worker):
-    """True if the recorded PID is alive AND is still the same process.
+    """True if the recorded PID is alive AND is provably the same process.
 
-    `start_time` is the authoritative anchor: a recycled PID necessarily has a
-    later start time, so a match rules out PID reuse. `comm` is recorded for
-    diagnostics but is NOT a rejection criterion -- macOS rewrites it shortly
-    after exec (a venv `python` shim first reports the venv path, then the real
-    framework binary), so comparing it strictly would make a healthy worker
-    look like a stranger.
+    Fail closed on every axis: the record must pass schema validation, and its
+    nonempty `start_time` must match the live process exactly. A missing or
+    mismatched `start_time` means we cannot prove ownership, so the PID is
+    treated as NOT ours and is never signalled.
+
+    `comm` is recorded for diagnostics but is NOT a rejection criterion --
+    macOS rewrites it shortly after exec (a venv `python` shim first reports
+    the venv path, then the real framework binary), so comparing it strictly
+    would make a healthy worker look like a stranger.
     """
-    if not worker or not worker.get("pid"):
+    record = _valid_worker_record(worker)
+    if record is None:
         return False
-    identity = _process_identity(worker["pid"])
+    identity = _process_identity(record["pid"])
     if identity is None:
         return False
     start_time, _comm = identity
-    if worker.get("start_time") and worker["start_time"] != start_time:
-        return False  # PID recycled by a different process
-    return True
+    if not isinstance(start_time, str) or not start_time.strip():
+        return False
+    # Exact match required -- no "absent means fine" path.
+    return record["start_time"] == start_time
 
 
 def is_worker_running():
@@ -197,29 +268,49 @@ def worker_pid():
 
 
 def worker_status():
-    """Label for the menu: Stopped / Starting... / Running (Present|Away) / Unresponsive."""
-    if not is_worker_running():
-        return "Stopped"
-    beat = read_heartbeat()
-    starting = _within_startup_grace()
-    if not beat or not beat.get("ts"):
-        # A freshly spawned worker has not written its first heartbeat yet;
-        # reporting "Unresponsive" there would be a false alarm.
-        return "Starting..." if starting else "Unresponsive"
-    if time.time() - float(beat["ts"]) > config.HEARTBEAT_STALE_SECONDS:
-        return "Starting..." if starting else "Unresponsive"
-    # The heartbeat must belong to the worker we are tracking.
+    """Label for the menu: Stopped / Starting... / Running (Present|Away) / Unresponsive.
+
+    Never raises: every malformed persisted value degrades to Stopped or
+    Unresponsive rather than throwing or showing stale presence as live.
+    """
     tracked = worker_pid()
-    if tracked is not None and beat.get("pid") not in (None, tracked):
-        return "Starting..." if starting else "Unresponsive"
-    return "Running (Present)" if beat.get("present") else "Running (Away)"
+    if tracked is None and not is_worker_running():
+        return "Stopped"
+
+    starting = _within_startup_grace()
+    degraded = "Starting..." if starting else "Unresponsive"
+
+    beat = _valid_heartbeat(read_heartbeat())
+    if beat is None:
+        # Missing, malformed, or identity-free heartbeat proves nothing.
+        return degraded
+    if time.time() - beat["ts"] > config.HEARTBEAT_STALE_SECONDS:
+        # The worker has already proved it can write a heartbeat for this PID,
+        # so it is no longer "starting" -- a stale beat means it is stuck.
+        if beat["pid"] == tracked:
+            return "Unresponsive"
+        return degraded
+    if tracked is None:
+        return degraded
+    # The heartbeat must belong to the exact worker we are tracking.
+    if beat["pid"] != tracked:
+        return degraded
+    record = load_state()["worker"]
+    if record is None or (
+        beat["start_time"] is not None
+        and beat["start_time"] != record["start_time"]
+    ):
+        return degraded
+    return "Running (Present)" if beat["present"] else "Running (Away)"
 
 
 def _within_startup_grace():
     """True while a just-started worker may legitimately have no heartbeat yet."""
-    worker = load_state()["worker"] or {}
+    worker = load_state()["worker"]
+    if not worker:
+        return False
     started_at = worker.get("started_at")
-    if not started_at:
+    if started_at is None:
         return False
     return (time.time() - float(started_at)) <= config.WORKER_STARTUP_GRACE_SECONDS
 

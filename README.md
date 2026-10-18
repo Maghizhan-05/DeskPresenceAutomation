@@ -61,9 +61,11 @@ exits. Note the honest limit of this guarantee: the app verifies the *worker
 process has exited*, which is what releases the device — it does not query the
 camera hardware's state directly.
 
-While the automation is disabled, no process of this project is running and the
-camera is untouched. The menu-bar app itself **never opens the camera** — only
-the worker does — so there is exactly one camera permission to approve, not two.
+While the automation is disabled, no worker process or camera client of this
+project is running and the camera is untouched. The menu-bar process itself
+stays alive (that is how the menu stays available) but it **never opens the
+camera** — only the worker does — so there is exactly one camera permission to
+approve, not two.
 
 ### Launch at Login
 
@@ -184,7 +186,7 @@ all render as `Unresponsive` (or `Starting…` during the startup grace).
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 97 tests, no hardware
+./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 113 tests, no hardware
 ```
 
 - `tests/test_state_machine.py` (21) — the state machine is pure (no camera, no
@@ -195,10 +197,11 @@ all render as `Unresponsive` (or `Starting…` during the startup grace).
   records, mixed ownership.
 - `tests/test_spotify_control.py` (9) — ownership is never claimed (or is rolled
   back) when `open location` fails or Spotify never appears.
-- `tests/test_worker_supervisor.py` (33) — worker identity across restarts,
-  SIGTERM→SIGKILL escalation, heartbeat freshness and status labels, and
-  `launchctl enable|disable` login-item handling (asserting `bootout` is never
-  used).
+- `tests/test_worker_supervisor.py` (49) — worker identity across restarts with
+  fail-closed schema validation (invalid PID, missing/empty `start_time`,
+  non-dict or corrupt state), SIGTERM→SIGKILL escalation, heartbeat freshness
+  and identity matching, and `launchctl enable|disable` login-item handling
+  (asserting `bootout` is never used).
 - `tests/test_menubar.py` (19) — menu structure, label/checkmark rendering for
   every status, and action wiring, with no GUI event loop.
 

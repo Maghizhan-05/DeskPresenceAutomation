@@ -47,4 +47,3 @@ WORKER_STARTUP_GRACE_SECONDS = 15.0
 WORKER_STOP_GRACE_SECONDS = 5.0
 # LaunchAgent label for the menu-bar UI (distinct from the headless agent).
 MENUBAR_LAUNCHD_LABEL = "com.user.deskpresence.menubar"
-
