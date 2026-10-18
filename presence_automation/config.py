@@ -32,3 +32,19 @@ SPOTIFY_URI = "spotify:album:1uwOU5ZjczJJozQkhzrGJr"
 STATE_DIR = "~/.local/state/deskpresence"
 SESSION_FILE = STATE_DIR + "/session.json"
 LOG_FILE = STATE_DIR + "/deskpresence.log"
+
+# --- Menu bar / worker supervision -------------------------------------------
+# Persisted enable preference + worker process identity (pid, start_time, comm).
+MENUBAR_STATE_FILE = STATE_DIR + "/menubar.json"
+# Worker liveness + presence heartbeat, rewritten atomically once per tick.
+WORKER_HEARTBEAT_FILE = STATE_DIR + "/heartbeat.json"
+# A heartbeat older than this is "Unresponsive" (5x the sample interval).
+HEARTBEAT_STALE_SECONDS = 5.0
+# A worker started less than this ago may not have written a heartbeat yet;
+# it shows "Starting..." rather than a false "Unresponsive".
+WORKER_STARTUP_GRACE_SECONDS = 15.0
+# Grace period for a SIGTERM'd worker before SIGKILL.
+WORKER_STOP_GRACE_SECONDS = 5.0
+# LaunchAgent label for the menu-bar UI (distinct from the headless agent).
+MENUBAR_LAUNCHD_LABEL = "com.user.deskpresence.menubar"
+

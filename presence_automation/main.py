@@ -12,7 +12,7 @@ import signal
 import sys
 import time
 
-from . import app_manager, config, spotify_control
+from . import app_manager, config, spotify_control, worker_supervisor
 from .state_machine import Event, PresenceStateMachine
 
 LOG = logging.getLogger("deskpresence")
@@ -98,10 +98,14 @@ def run(interval=None, max_ticks=None, detector=None):
             elif event is Event.DEPARTED:
                 on_departed()
 
+            # Liveness + presence for the menu bar. Atomic, one write per tick.
+            worker_supervisor.write_heartbeat(machine.state.value, present)
+
             time.sleep(interval)
     finally:
         if owns_detector:
             detector.close()
+        worker_supervisor.clear_heartbeat()
         LOG.info("stopped after %s samples", ticks)
     return 0
 

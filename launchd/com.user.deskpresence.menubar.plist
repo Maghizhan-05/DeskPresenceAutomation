@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Desk Presence Automation -- MENU BAR LaunchAgent (recommended).
+
+  This starts the menu-bar UI at login. The UI itself starts/stops the headless
+  worker based on your saved Enable/Disable preference, so the camera is only
+  in use while the automation is enabled from the menu.
+
+  Install:
+    cp launchd/com.user.deskpresence.menubar.plist ~/Library/LaunchAgents/
+    # edit the absolute paths below to match your checkout, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.deskpresence.menubar.plist
+
+  "Launch at Login" in the menu toggles this agent with
+  `launchctl enable|disable` (NOT bootout), so flipping it never terminates the
+  running menu-bar UI.
+
+  Camera permission belongs to the WORKER process, not this UI: the menu-bar
+  process never opens the camera, so there is exactly one TCC grant to approve.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.deskpresence.menubar</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/maghizhan/Developments/DeskPresenceAutomation/.venv/bin/python</string>
+        <string>-m</string>
+        <string>presence_automation.menubar</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/maghizhan/Developments/DeskPresenceAutomation</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/maghizhan/.local/state/deskpresence/menubar.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/maghizhan/.local/state/deskpresence/menubar.err.log</string>
+</dict>
+</plist>
