@@ -3,6 +3,9 @@
 # --- Detection cadence -------------------------------------------------------
 CAMERA_INDEX = 0
 SAMPLE_INTERVAL_SECONDS = 1.0
+# Apple's bundled on-device face detector; use "haar" only as a manual fallback.
+DETECTOR_BACKEND = "vision"
+FACE_CONFIDENCE_THRESHOLD = 0.7
 
 # --- State machine thresholds ------------------------------------------------
 # Arrival requires this many *consecutive* positive samples (~3s at 1 fps),

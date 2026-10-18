@@ -189,7 +189,12 @@ def _self_test():
     LOG.info("tracked-as-ours (session file): %s", app_manager.tracked_bundle_ids())
     try:
         with Detector() as detector:
-            samples = [detector.sample() for _ in range(3)]
+            samples = []
+            for index in range(3):
+                present = detector.sample()
+                samples.append(present)
+                LOG.info("camera sample %s: present=%s confidence=%s",
+                         index + 1, present, detector.last_confidences)
         LOG.info("camera ok, 3 samples -> %s", samples)
     except DetectorUnavailable as exc:
         LOG.error("camera FAILED: %s", exc)

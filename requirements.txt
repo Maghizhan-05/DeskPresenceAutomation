@@ -3,5 +3,7 @@
 # ONNX model download. Pinned to 4.x so detection stays fully offline.
 opencv-python>=4.9,<5
 pyobjc-framework-Cocoa>=10.0
+# Apple's bundled on-device face model; pulls matching Quartz and CoreML bridges.
+pyobjc-framework-Vision>=10.0,<13
 # Menu-bar status item (thin NSStatusItem wrapper over PyObjC).
 rumps>=0.4,<1

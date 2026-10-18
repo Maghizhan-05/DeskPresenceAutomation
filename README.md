@@ -111,6 +111,26 @@ clutter, a photo, a reflection — no longer resets the timer, and it does not
 rewind absence already accrued. Without this, a lone stray detection reset the
 whole 30s window and departure never fired.
 
+### Face detector accuracy
+
+The default backend is Apple's **Vision** (`VNDetectFaceRectanglesRequest`) using
+its bundled on-device model; no model file is downloaded and no frame is saved
+or sent to a service. The OpenCV camera supplies the same upright, unmirrored
+pixels to Vision and the preview. Vision's normalized, lower-left face box is
+converted to the preview's top-left pixel coordinates. Only observations at or
+above `FACE_CONFIDENCE_THRESHOLD` count as present; the existing 3-sample
+arrival/return confirmation and 30-second absence logic remain unchanged.
+
+`FACE_CONFIDENCE_THRESHOLD = 0.7` is a starting point, **not a guarantee of
+perfect classification**. If seated faces are consistently missed, lower it
+slightly; if an empty desk is recognized as occupied, increase it slightly.
+Always validate *both* seated and empty-desk periods after adjusting it: a
+higher threshold reduces false positives at the cost of missed real faces.
+To select the legacy offline cascade on an unsupported machine, set
+`DETECTOR_BACKEND = "haar"` in `config.py`; the Vision dependency can then be
+absent. `--self-test` reports per-sample Vision confidence values without
+logging frames, so you can check the signal before enabling automation.
+
 ### Launch at Login
 
 The toggle uses `launchctl enable|disable`, deliberately **not**
@@ -140,7 +160,8 @@ Verify everything with the hardware/app probe:
 ```
 
 Expected output: each tracked app's running state, the session file contents,
-and `camera ok, 3 samples -> [...]`.
+three `camera sample N: present=... confidence=(...)` lines, and
+`camera ok, 3 samples -> [...]`.
 
 ## Advanced: headless mode (no menu bar)
 
@@ -173,6 +194,8 @@ Everything tunable lives in `presence_automation/config.py`:
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
+| `DETECTOR_BACKEND` | `"vision"` | Apple on-device Vision; `"haar"` remains an offline fallback |
+| `FACE_CONFIDENCE_THRESHOLD` | `0.7` | minimum Vision face score; tune after testing occupied AND empty desk |
 | `ARRIVAL_CONSECUTIVE_SAMPLES` | `3` | consecutive positive frames before "arrived" fires |
 | `ABSENCE_SECONDS` | `30.0` | continuous absence before "departed" fires |
 | `COOLDOWN_SECONDS` | `60.0` | post-departure window where re-launch is blocked |
@@ -240,7 +263,7 @@ once the process is confirmed exited.
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 206 tests, no hardware
+./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 216 tests, no camera hardware
 ```
 
 - `tests/test_state_machine.py` (34) — the state machine is pure (no camera, no
@@ -264,6 +287,10 @@ once the process is confirmed exited.
 - `tests/test_menubar.py` (33) — menu structure, label/checkmark rendering for
   every status, and action wiring, with no GUI event loop; preview open/close
   never starts or stops the worker.
+- `tests/test_detector.py` (10) — Vision confidence gate, normalized lower-left
+  to unmirrored top-left preview conversion, malformed observation handling,
+  real in-memory Vision bridge without camera, backend selection, and
+  per-sample confidence diagnostics.
 - `tests/test_preview.py` (40) — shared-memory lifecycle (fixed size across 200
   writes, overwrite-in-place, unlink on close, stale segment from a crashed
   worker is replaced), ownership-aware tracker registration with an asserted
@@ -278,7 +305,7 @@ once the process is confirmed exited.
 presence_automation/
   config.py             constants only, no I/O
   state_machine.py      pure IDLE/ARRIVING/PRESENT/LEAVING/COOLDOWN machine
-  detector.py           one webcam frame -> bool, nothing retained
+  detector.py           one webcam frame -> bool, Vision by default; Haar fallback
   app_manager.py        launch/quit with per-PID ownership
   spotify_control.py    spotify: URI playback + pause
   main.py               loop; side effects on transition edges only
@@ -287,6 +314,7 @@ presence_automation/
   preview_buffer.py     fixed-size shared-memory slot, one frame, in place
   preview_window.py     opt-in preview window + countdown text
 tests/test_state_machine.py
+tests/test_detector.py
 tests/test_app_manager.py
 tests/test_spotify_control.py
 tests/test_worker_supervisor.py

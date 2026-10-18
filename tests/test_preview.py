@@ -162,6 +162,8 @@ class DetectorPreviewTests(unittest.TestCase):
         self.np = np
         self.Detector = Detector
         self.det = Detector.__new__(Detector)   # no camera, no cascade load
+        self.det.backend = "haar"  # these existing regressions exercise Haar fallback
+        self.det.last_confidences = ()
         self.det._capture = FakeCapture(np.zeros((480, 640, 3), dtype=np.uint8))
 
         class _Cascade(object):
