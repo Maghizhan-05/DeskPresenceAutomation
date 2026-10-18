@@ -248,8 +248,17 @@ def read_heartbeat():
     return _read_json(_heartbeat_path(), None) or None
 
 
+def heartbeat_exists():
+    """True if a heartbeat file is present, regardless of whether it is valid.
+
+    This is what separates "not written yet" (Starting...) from "written but
+    untrustworthy" (Unresponsive).
+    """
+    return os.path.exists(_heartbeat_path())
+
+
 # --- liveness ----------------------------------------------------------------
-_CHILD = {"popen": None}  # type: dict
+# _CHILD is declared once, above, with its full schema {popen, pid, start_time}.
 
 
 def _identity_matches(worker):
@@ -320,28 +329,27 @@ def worker_status():
     if tracked is None and not is_worker_running():
         return "Stopped"
 
-    starting = _within_startup_grace()
-    degraded = "Starting..." if starting else "Unresponsive"
+    # "Starting..." is reserved for ONE case: the worker has not written a
+    # heartbeat yet. A heartbeat file that exists but fails schema or exact
+    # identity validation is untrustworthy, never "still starting".
+    if not heartbeat_exists():
+        return "Starting..." if _within_startup_grace() else "Unresponsive"
 
     beat = _valid_heartbeat(read_heartbeat())
     if beat is None:
-        # Missing, malformed, or identity-free heartbeat proves nothing.
-        return degraded
+        # Present but malformed or identity-free: proves nothing.
+        return "Unresponsive"
     if time.time() - beat["ts"] > config.HEARTBEAT_STALE_SECONDS:
-        # The worker has already proved it can write a heartbeat for this PID,
-        # so it is no longer "starting" -- a stale beat means it is stuck.
-        if beat["pid"] == tracked:
-            return "Unresponsive"
-        return degraded
+        return "Unresponsive"
     if tracked is None:
-        return degraded
+        return "Unresponsive"
     # The heartbeat must belong to the exact worker we are tracking: same PID
     # AND same start_time. Both are mandatory before any "Running" label.
     if beat["pid"] != tracked:
-        return degraded
+        return "Unresponsive"
     tracked_start = _tracked_start_time()
     if not tracked_start or beat["start_time"] != tracked_start:
-        return degraded
+        return "Unresponsive"
     return "Running (Present)" if beat["present"] else "Running (Away)"
 
 

@@ -473,6 +473,55 @@ class StatusTests(SupervisorTestCase):
         self._beat(False, state="idle")
         self.assertEqual(ws.worker_status(), "Running (Away)")
 
+    def test_invalid_heartbeat_during_grace_is_unresponsive_not_starting(self):
+        """Reviewer: a PRESENT but invalid heartbeat is never 'Starting...'."""
+        ws.start_worker()
+        self.assertTrue(ws._within_startup_grace())   # grace is genuinely active
+        pid = ws.worker_pid()
+        self.assertIsNotNone(pid)
+        for label, payload in (
+            ("missing start_time", {"present": True, "pid": pid, "ts": time.time()}),
+            ("empty start_time", {"present": True, "pid": pid,
+                                  "start_time": "", "ts": time.time()}),
+            ("no pid", {"present": True, "ts": time.time()}),
+            ("wrong pid", {"present": True, "pid": pid + 9999,
+                           "start_time": "x", "ts": time.time()}),
+            ("mismatched start_time", {"present": True, "pid": pid,
+                                       "start_time": "not-the-real-one",
+                                       "ts": time.time()}),
+            ("nonnumeric ts", {"present": True, "pid": pid,
+                               "start_time": "x", "ts": "soon"}),
+        ):
+            ws._atomic_write(ws._heartbeat_path(), payload)
+            self.assertEqual(
+                ws.worker_status(), "Unresponsive",
+                "%s must be Unresponsive even during startup grace" % label,
+            )
+
+    def test_corrupt_heartbeat_during_grace_is_unresponsive(self):
+        ws.start_worker()
+        self.assertTrue(ws._within_startup_grace())
+        with open(ws._heartbeat_path(), "w") as handle:
+            handle.write("{not json")
+        self.assertEqual(ws.worker_status(), "Unresponsive")
+
+    def test_starting_is_reserved_for_no_heartbeat_file(self):
+        ws.start_worker()
+        self.assertFalse(ws.heartbeat_exists())
+        self.assertEqual(ws.worker_status(), "Starting...")
+        # Once a valid beat lands, it goes Running; once removed again it is
+        # back to the only legitimate Starting... case.
+        self._beat(True)
+        self.assertEqual(ws.worker_status(), "Running (Present)")
+        ws.clear_heartbeat()
+        self.assertEqual(ws.worker_status(), "Starting...")
+
+    def test_no_heartbeat_after_grace_expires_is_unresponsive(self):
+        ws.start_worker()
+        self._age_out_startup_grace()
+        self.assertFalse(ws.heartbeat_exists())
+        self.assertEqual(ws.worker_status(), "Unresponsive")
+
     def test_stale_heartbeat_is_unresponsive_not_stale_presence(self):
         ws.start_worker()
         self._age_out_startup_grace()

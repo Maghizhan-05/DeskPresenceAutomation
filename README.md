@@ -182,7 +182,10 @@ per tick with `{state, present, pid, start_time, ts}`. The menu reads only that
 file, so it never presents stale presence as live: a heartbeat older than
 `HEARTBEAT_STALE_SECONDS`, one whose `pid`/`start_time` do not both match the
 tracked worker exactly, a heartbeat missing either identity field, or a corrupt
-file all render as `Unresponsive` (or `Starting…` during the startup grace).
+file all render as `Unresponsive`. `Starting…` is reserved for the single case
+where the worker has not written a heartbeat file *at all* yet (within
+`WORKER_STARTUP_GRACE_SECONDS`); a heartbeat that exists but fails validation is
+always `Unresponsive`, never "still starting".
 
 Ownership of a worker this process spawned is additionally held in memory
 (`pid` + `start_time`), independent of the persisted file. A corrupted or
@@ -193,7 +196,7 @@ once the process is confirmed exited.
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 122 tests, no hardware
+./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 126 tests, no hardware
 ```
 
 - `tests/test_state_machine.py` (21) — the state machine is pure (no camera, no
@@ -204,7 +207,7 @@ once the process is confirmed exited.
   records, mixed ownership.
 - `tests/test_spotify_control.py` (9) — ownership is never claimed (or is rolled
   back) when `open location` fails or Spotify never appears.
-- `tests/test_worker_supervisor.py` (58) — worker identity across restarts with
+- `tests/test_worker_supervisor.py` (62) — worker identity across restarts with
   fail-closed schema validation (invalid PID, missing/empty `start_time`,
   non-dict or corrupt state), direct `Popen` termination of our own child even
   when persisted state is corrupted, SIGTERM→SIGKILL escalation, heartbeat
