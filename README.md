@@ -73,8 +73,8 @@ approve, not two.
 **Show Camera Preview** opens a small window with the live camera image, a box
 around a detected face, and a status line such as
 `Away - closing apps in 18s`. It is **off by default** and must be turned on
-explicitly each time; closing the window stops the preview but never stops the
-automation.
+explicitly each time; closing the window — with the menu item or the window's
+own red close button — stops the preview but never stops the automation.
 
 How it stays private:
 
@@ -86,6 +86,11 @@ How it stays private:
 * The block is destroyed when the preview is switched off, when the worker
   stops, and when the app quits. A segment left by a crashed worker is unlinked
   and recreated rather than reused, so no frame outlives the worker.
+* The request is a **lease** bound to the requesting menu's PID and process
+  start time, re-stamped while the window is open. If the menu crashes, the
+  lease expires within `PREVIEW_LEASE_SECONDS` (10s) and the worker stops
+  publishing — a dead UI can never leave frames flowing. A recycled PID fails
+  the start-time check and is likewise refused.
 * Turning preview on does not change detection: the frame is published **after**
   inference, so the presence result is identical either way.
 
@@ -235,7 +240,7 @@ once the process is confirmed exited.
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 183 tests, no hardware
+./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 206 tests, no hardware
 ```
 
 - `tests/test_state_machine.py` (34) — the state machine is pure (no camera, no
@@ -249,20 +254,23 @@ once the process is confirmed exited.
   records, mixed ownership.
 - `tests/test_spotify_control.py` (9) — ownership is never claimed (or is rolled
   back) when `open location` fails or Spotify never appears.
-- `tests/test_worker_supervisor.py` (68) — worker identity across restarts with
+- `tests/test_worker_supervisor.py` (75) — worker identity across restarts with
   fail-closed schema validation (invalid PID, missing/empty `start_time`,
   non-dict or corrupt state), direct `Popen` termination of our own child even
   when persisted state is corrupted, SIGTERM→SIGKILL escalation, heartbeat
   freshness and full-identity matching, preview request/segment cleanup on stop,
   and `launchctl enable|disable` login-item handling (asserting `bootout` is
   never used).
-- `tests/test_menubar.py` (26) — menu structure, label/checkmark rendering for
+- `tests/test_menubar.py` (33) — menu structure, label/checkmark rendering for
   every status, and action wiring, with no GUI event loop; preview open/close
   never starts or stops the worker.
-- `tests/test_preview.py` (31) — shared-memory lifecycle (fixed size across 200
+- `tests/test_preview.py` (40) — shared-memory lifecycle (fixed size across 200
   writes, overwrite-in-place, unlink on close, stale segment from a crashed
-  worker is replaced), the preview-off default touching no buffer, identical
-  detection results with preview on and off, and countdown text rendering.
+  worker is replaced), ownership-aware tracker registration with an asserted
+  **clean stderr** subprocess run, face-box validation/clamping and proof the
+  rectangle is burned into the displayed copy without mutating the source,
+  the preview-off default touching no buffer, identical detection results with
+  preview on and off, and countdown text rendering.
 
 ## Layout
 

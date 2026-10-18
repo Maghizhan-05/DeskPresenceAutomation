@@ -6,6 +6,7 @@ No real worker, no real launchctl: `_popen`, `_signal`, `_process_identity` and
 
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -440,6 +441,13 @@ class PreviewRequestTests(SupervisorTestCase):
         SupervisorTestCase.setUp(self)
         self._orig_preview = config.PREVIEW_REQUEST_FILE
         config.PREVIEW_REQUEST_FILE = os.path.join(self.tmp, "preview.json")
+        # The requester identity check runs against THIS process, so the fake
+        # world must know it -- otherwise every lease looks like a dead PID.
+        self.world.procs[os.getpid()] = {
+            "start_time": "Sun Oct 18 09:00:00 2026",
+            "comm": "/usr/bin/python3",
+            "ignores_term": False,
+        }
 
     def tearDown(self):
         config.PREVIEW_REQUEST_FILE = self._orig_preview
@@ -470,6 +478,86 @@ class PreviewRequestTests(SupervisorTestCase):
         self.assertTrue(ws.preview_requested())
         ws.stop_worker(timeout=1.0)
         self.assertFalse(ws.preview_requested())
+
+    def test_request_carries_requester_identity_and_lease(self):
+        ws.set_preview_requested(True)
+        data = ws._read_json(ws._preview_path(), {})
+        self.assertEqual(data["pid"], os.getpid())
+        self.assertTrue(data["start_time"])
+        self.assertIsInstance(data["ts"], float)
+
+    def test_expired_lease_fails_closed(self):
+        ws.set_preview_requested(True)
+        self.assertTrue(ws.preview_requested())
+        data = ws._read_json(ws._preview_path(), {})
+        data["ts"] = time.time() - (config.PREVIEW_LEASE_SECONDS + 5.0)
+        ws._atomic_write(ws._preview_path(), data)
+        self.assertFalse(
+            ws.preview_requested(), "a stale lease must stop publishing"
+        )
+
+    def test_renewing_the_lease_keeps_it_alive(self):
+        ws.set_preview_requested(True)
+        data = ws._read_json(ws._preview_path(), {})
+        data["ts"] = time.time() - (config.PREVIEW_LEASE_SECONDS + 5.0)
+        ws._atomic_write(ws._preview_path(), data)
+        self.assertFalse(ws.preview_requested())
+        self.assertTrue(ws.renew_preview_lease())
+        self.assertTrue(ws.preview_requested())
+
+    def test_dead_requester_fails_closed(self):
+        """Reviewer: a crashed menu must not leave frames publishing."""
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        ws._atomic_write(
+            ws._preview_path(),
+            {
+                "preview": True,
+                "pid": dead.pid,
+                "start_time": "Sun Oct 18 00:00:00 2026",
+                "ts": time.time(),
+            },
+        )
+        self.assertFalse(
+            ws.preview_requested(), "dead requester must not hold the camera"
+        )
+
+    def test_recycled_requester_pid_fails_closed(self):
+        """A live PID with a different start_time is not our requester."""
+        ws._atomic_write(
+            ws._preview_path(),
+            {
+                "preview": True,
+                "pid": os.getpid(),
+                "start_time": "Mon Jan 1 00:00:00 2001",   # wrong identity
+                "ts": time.time(),
+            },
+        )
+        self.assertFalse(ws.preview_requested())
+
+    def test_request_without_identity_fails_closed(self):
+        for payload in (
+            {"preview": True, "ts": time.time()},
+            {"preview": True, "pid": os.getpid(), "ts": time.time()},
+            {"preview": True, "pid": os.getpid(), "start_time": "",
+             "ts": time.time()},
+            {"preview": True, "pid": "x", "start_time": "y",
+             "ts": time.time()},
+            {"preview": True, "pid": os.getpid(), "start_time": "y",
+             "ts": "soon"},
+        ):
+            ws._atomic_write(ws._preview_path(), payload)
+            self.assertFalse(
+                ws.preview_requested(), "%r must fail closed" % (payload,)
+            )
+
+    def test_renew_by_a_different_process_is_refused(self):
+        ws._atomic_write(
+            ws._preview_path(),
+            {"preview": True, "pid": os.getpid() + 1,
+             "start_time": "x", "ts": time.time()},
+        )
+        self.assertFalse(ws.renew_preview_lease())
 
     def test_stop_worker_unlinks_the_preview_segment(self):
         from presence_automation import preview_buffer

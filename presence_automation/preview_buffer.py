@@ -37,6 +37,17 @@ class PreviewUnavailable(RuntimeError):
     """Shared memory could not be created or mapped."""
 
 
+# Names this process OWNS as a writer. A reader mapping must never unregister
+# a name owned here, or the writer's later unlink double-removes it from the
+# resource tracker and raises KeyError on shutdown.
+_OWNED_NAMES = set()
+
+
+def owns(name):
+    """True if this process holds the writer for `name`."""
+    return name in _OWNED_NAMES
+
+
 def unlink_stale(name=None):
     """Remove an orphaned segment left behind by a crashed worker.
 
@@ -55,6 +66,7 @@ def unlink_stale(name=None):
         existing.unlink()
     except Exception:
         return False
+    _OWNED_NAMES.discard(name)
     return True
 
 
@@ -73,6 +85,7 @@ class PreviewWriter:
             raise PreviewUnavailable("cannot create preview buffer: %s" % exc)
         self._seq = 0
         self.closed = False
+        _OWNED_NAMES.add(self.name)
 
     @property
     def size(self):
@@ -109,6 +122,7 @@ class PreviewWriter:
         if self.closed:
             return
         self.closed = True
+        _OWNED_NAMES.discard(self.name)
         try:
             self._shm.close()
         finally:
@@ -129,14 +143,17 @@ class PreviewReader:
         except FileNotFoundError:
             raise PreviewUnavailable("no preview buffer (is the worker running?)")
         # A reader never owns the segment: drop it from this process's
-        # resource tracker so shutdown does not warn about (or try to clean
-        # up) a segment the writer is responsible for.
-        try:
-            from multiprocessing import resource_tracker
+        # resource tracker so shutdown does not warn about a segment the
+        # writer is responsible for. BUT only when this process is not itself
+        # the writer -- unregistering a name we own makes the writer's later
+        # unlink double-remove it (KeyError in resource_tracker).
+        if not owns(self.name):
+            try:
+                from multiprocessing import resource_tracker
 
-            resource_tracker.unregister(self._shm._name, "shared_memory")
-        except Exception:
-            pass
+                resource_tracker.unregister(self._shm._name, "shared_memory")
+            except Exception:
+                pass
         if self._shm.size < segment_size():
             self._shm.close()
             raise PreviewUnavailable("preview buffer has unexpected size")

@@ -264,17 +264,71 @@ def _preview_path():
 
 
 def set_preview_requested(enabled):
-    """Ask the worker to publish preview frames. Opt-in, off by default."""
-    _atomic_write(_preview_path(), {"preview": bool(enabled)})
-    return bool(enabled)
+    """Ask the worker to publish preview frames. Opt-in, off by default.
+
+    The request is bound to the REQUESTING process's identity (pid +
+    start_time) and carries a timestamp lease. If the menu crashes or the PID
+    is recycled, the request expires and publishing stops -- a crashed UI can
+    never leave the camera publishing frames indefinitely.
+    """
+    if not enabled:
+        _atomic_write(_preview_path(), {"preview": False})
+        return False
+    pid = os.getpid()
+    identity = _process_identity(pid)
+    _atomic_write(
+        _preview_path(),
+        {
+            "preview": True,
+            "pid": pid,
+            "start_time": identity[0] if identity else None,
+            "ts": time.time(),
+        },
+    )
+    return True
+
+
+def renew_preview_lease():
+    """Re-stamp the lease. Called by the menu each refresh while open."""
+    data = _read_json(_preview_path(), None)
+    if not isinstance(data, dict) or not data.get("preview"):
+        return False
+    if data.get("pid") != os.getpid():
+        return False
+    data["ts"] = time.time()
+    _atomic_write(_preview_path(), data)
+    return True
 
 
 def preview_requested():
-    """True only if the menu explicitly asked for preview. Fails closed."""
+    """True only if a LIVE requester holds an unexpired lease. Fails closed."""
     data = _read_json(_preview_path(), None)
     if not isinstance(data, dict):
         return bool(config.PREVIEW_ENABLED_DEFAULT)
-    return bool(data.get("preview", config.PREVIEW_ENABLED_DEFAULT))
+    if not data.get("preview"):
+        return False
+
+    # Lease must be fresh.
+    ts = data.get("ts")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return False
+    if time.time() - float(ts) > config.PREVIEW_LEASE_SECONDS:
+        return False
+
+    # Requester must still be alive AND be the same process (not a recycled
+    # PID), validated exactly like the worker's own identity check.
+    pid = data.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    start_time = data.get("start_time")
+    if not isinstance(start_time, str) or not start_time.strip():
+        return False
+    if not _signal(pid, 0):
+        return False
+    identity = _process_identity(pid)
+    if not identity or identity[0] != start_time:
+        return False
+    return True
 
 
 def clear_preview_request():

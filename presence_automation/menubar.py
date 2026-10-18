@@ -117,13 +117,20 @@ class DeskPresenceMenuBar(object):
         if not isinstance(handle, tuple) or len(handle) < 4:
             return False
         _window, image_view, label, controller = handle[:4]
+        # Renew the lease FIRST: a rendering failure must never let the lease
+        # lapse while the window is genuinely open.
+        try:
+            self.supervisor.renew_preview_lease()
+        except Exception:
+            pass
         try:
             data, box, text = controller.tick()
             label.setStringValue_(text)
             if data is not None:
-                from .preview_window import frame_to_nsimage
+                from .preview_window import draw_box, frame_to_nsimage
 
-                image_view.setImage_(frame_to_nsimage(data))
+                # Burn the validated face box into the displayed copy.
+                image_view.setImage_(frame_to_nsimage(draw_box(data, box)))
             return True
         except Exception:
             return False
@@ -156,11 +163,35 @@ class DeskPresenceMenuBar(object):
 
             opener = show_window
         try:
-            self._preview = opener()
+            # The window's red close button must disable publishing too, so
+            # hand the opener a callback that clears our handle.
+            self._preview = opener(on_close=self._on_preview_window_closed)
+        except TypeError:
+            # Opener that does not accept the callback (older/injected fake).
+            try:
+                self._preview = opener()
+            except Exception:
+                self._preview = None
         except Exception:
             # A preview failure must never take the menu down.
             self._preview = None
         return self.refresh()
+
+    def _on_preview_window_closed(self):
+        """Called by the window delegate when the user clicks the red button.
+
+        The window's own delegate already stopped publishing; this just drops
+        our handle so the checkmark clears and we stop polling a dead window.
+        """
+        self._preview = None
+        try:
+            self.supervisor.set_preview_requested(False)
+        except Exception:
+            pass
+        try:
+            self.refresh()
+        except Exception:
+            pass
 
     def _close_preview(self):
         handle = self._preview

@@ -102,12 +102,85 @@ class PreviewController(object):
             self._reader = None
 
 
+def clamp_box(box, width=None, height=None):
+    """Validate/clamp a face box to the preview bounds.
+
+    Returns None when the box is absent, malformed, or has no area, so the
+    renderer never draws garbage coordinates. Pure -- unit-testable.
+    """
+    width = width or config.PREVIEW_WIDTH
+    height = height or config.PREVIEW_HEIGHT
+    if not box or len(box) != 4:
+        return None
+    try:
+        x, y, w, h = (int(v) for v in box)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    # Clip to the frame; drop it entirely if it lies fully outside.
+    x0 = max(0, min(x, width))
+    y0 = max(0, min(y, height))
+    x1 = max(0, min(x + w, width))
+    y1 = max(0, min(y + h, height))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def draw_box(data, box, width=None, height=None, thickness=2):
+    """Burn a green rectangle into a copy of the BGR bytes. In memory only.
+
+    Returns the original bytes untouched when the box is invalid.
+    """
+    width = width or config.PREVIEW_WIDTH
+    height = height or config.PREVIEW_HEIGHT
+    clamped = clamp_box(box, width, height)
+    if clamped is None:
+        return data
+    x, y, w, h = clamped
+    buf = bytearray(data)
+    stride = width * 3
+
+    def _row(py, px0, px1):
+        for px in range(px0, px1):
+            off = py * stride + px * 3
+            if 0 <= off <= len(buf) - 3:
+                buf[off] = 0        # B
+                buf[off + 1] = 255  # G
+                buf[off + 2] = 0    # R
+
+    for t in range(thickness):
+        top, bottom = y + t, y + h - 1 - t
+        if 0 <= top < height:
+            _row(top, x, x + w)
+        if 0 <= bottom < height:
+            _row(bottom, x, x + w)
+    for py in range(y, y + h):
+        if not (0 <= py < height):
+            continue
+        for t in range(thickness):
+            for px in (x + t, x + w - 1 - t):
+                if 0 <= px < width:
+                    off = py * stride + px * 3
+                    if 0 <= off <= len(buf) - 3:
+                        buf[off] = 0
+                        buf[off + 1] = 255
+                        buf[off + 2] = 0
+    return bytes(buf)
+
+
 # --- AppKit window (lazy, never imported during unit tests) ------------------
-def show_window(controller=None):  # pragma: no cover - requires a window server
-    """Open the preview NSWindow. Returns the window object."""
+def show_window(controller=None, on_close=None):  # pragma: no cover - requires a window server
+    """Open the preview NSWindow. Returns (window, image_view, label, controller).
+
+    `on_close` is invoked when the user clicks the window's red close button,
+    so closing the window disables frame publishing exactly like the menu
+    toggle does.
+    """
     import AppKit
-    import objc  # noqa: F401  (ensures the bridge is initialised)
-    from Foundation import NSMakeRect
+    import objc
+    from Foundation import NSMakeRect, NSObject
 
     controller = controller or PreviewController()
     controller.open()
@@ -124,6 +197,28 @@ def show_window(controller=None):  # pragma: no cover - requires a window server
     )
     window.setTitle_(WINDOW_TITLE)
     window.setReleasedWhenClosed_(False)
+
+    class _CloseDelegate(NSObject):
+        def windowWillClose_(self, _notification):
+            # Red close button: stop publishing and let the menu clear state.
+            try:
+                controller.close()
+            except Exception:
+                pass
+            if on_close is not None:
+                try:
+                    on_close()
+                except Exception:
+                    pass
+
+    delegate = _CloseDelegate.alloc().init()
+    window.setDelegate_(delegate)
+    # The delegate is a weak reference on NSWindow: keep it alive by hanging it
+    # off the window object, or it is collected and the callback never fires.
+    objc.setAssociatedObject(
+        window, b"dp_close_delegate", delegate,
+        objc.OBJC_ASSOCIATION_RETAIN,
+    )
 
     image_view = AppKit.NSImageView.alloc().initWithFrame_(
         NSMakeRect(0, 28, width, height)

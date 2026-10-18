@@ -65,3 +65,7 @@ PREVIEW_HEIGHT = 240
 PREVIEW_CHANNELS = 3
 # Toggle file: the menu asks for preview, the worker picks it up next tick.
 PREVIEW_REQUEST_FILE = STATE_DIR + "/preview.json"
+# A preview request is a LEASE: the menu re-stamps it while the window is open.
+# If the menu crashes, the lease expires this many seconds later and the worker
+# stops publishing frames. Must comfortably exceed the menu refresh interval.
+PREVIEW_LEASE_SECONDS = 10.0

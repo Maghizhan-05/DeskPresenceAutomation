@@ -32,6 +32,16 @@ class FakeSupervisor(object):
         self.enabled = enabled
         self.running = status != "Stopped"
         self.calls = []
+        self.preview_requests = []
+        self.lease_renewals = 0
+
+    def set_preview_requested(self, enabled):
+        self.preview_requests.append(bool(enabled))
+        return bool(enabled)
+
+    def renew_preview_lease(self):
+        self.lease_renewals += 1
+        return True
 
     # -- supervisor API ----------------------------------------------------
     def worker_status(self):
@@ -109,15 +119,16 @@ class FakeLabel(object):
 
 
 class FakePreviewController(object):
-    def __init__(self, data=None, text="At desk"):
+    def __init__(self, data=None, text="At desk", box=(0, 0, 0, 0)):
         self.data = data
         self.text = text
+        self.box = box
         self.closed = False
         self.ticks = 0
 
     def tick(self):
         self.ticks += 1
-        return self.data, (0, 0, 0, 0), self.text
+        return self.data, self.box, self.text
 
     def close(self):
         self.closed = True
@@ -346,6 +357,118 @@ class PreviewMenuTests(unittest.TestCase):
         self.assertTrue(handle[0].closed)
         self.assertEqual(supervisor.calls, ["stop"])
         self.assertEqual(len(controller.quit_calls), 1)
+
+
+class PreviewWindowCloseTests(unittest.TestCase):
+    """Reviewer: the red close button must fully disable publishing."""
+
+    def _opener(self, handle, captured):
+        def opener(on_close=None):
+            captured.append(on_close)
+            return handle
+        return opener
+
+    def test_opener_receives_an_on_close_callback(self):
+        handle, captured = fake_preview_handle(), []
+        controller, _ = build(
+            status="Running (Present)",
+            preview_opener=self._opener(handle, captured),
+        )
+        controller.on_toggle_preview()
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(callable(captured[0]), "no close callback was passed")
+
+    def test_red_button_close_clears_handle_and_checkmark(self):
+        handle, captured = fake_preview_handle(), []
+        controller, supervisor = build(
+            status="Running (Present)",
+            preview_opener=self._opener(handle, captured),
+        )
+        controller.on_toggle_preview()
+        self.assertEqual(controller.preview_item.state, 1)
+
+        captured[0]()          # simulate windowWillClose_
+
+        self.assertIsNone(controller._preview, "stale window handle retained")
+        self.assertEqual(controller.preview_item.state, 0)
+        self.assertIn(False, supervisor.preview_requests,
+                      "publishing was not disabled on window close")
+
+    def test_red_button_close_does_not_stop_the_worker(self):
+        handle, captured = fake_preview_handle(), []
+        controller, supervisor = build(
+            status="Running (Present)",
+            preview_opener=self._opener(handle, captured),
+        )
+        controller.on_toggle_preview()
+        supervisor.calls = []
+        captured[0]()
+        self.assertEqual(supervisor.calls, [])
+        self.assertTrue(supervisor.is_worker_running())
+
+    def test_no_polling_after_window_close(self):
+        handle, captured = fake_preview_handle(), []
+        controller, _ = build(
+            status="Running (Present)",
+            preview_opener=self._opener(handle, captured),
+        )
+        controller.on_toggle_preview()
+        captured[0]()
+        ticks_before = handle[3].ticks
+        controller.refresh()
+        self.assertEqual(handle[3].ticks, ticks_before,
+                         "menu kept polling a closed window")
+
+    def test_menu_toggle_still_works_after_window_close(self):
+        first, captured = fake_preview_handle(), []
+        controller, _ = build(
+            status="Running (Present)",
+            preview_opener=self._opener(first, captured),
+        )
+        controller.on_toggle_preview()
+        captured[0]()
+        controller.on_toggle_preview()      # reopen
+        self.assertIsNotNone(controller._preview)
+        self.assertEqual(controller.preview_item.state, 1)
+
+    def test_refresh_renews_the_lease_while_open(self):
+        handle = fake_preview_handle(data=b"f")
+        controller, supervisor = build(
+            status="Running (Present)", preview_opener=lambda on_close=None: handle
+        )
+        controller.on_toggle_preview()
+        before = supervisor.lease_renewals
+        controller.refresh()
+        self.assertGreater(supervisor.lease_renewals, before,
+                           "lease was not renewed while the preview is open")
+
+    def test_box_reaches_the_renderer(self):
+        """Regression: the face box must not be silently dropped."""
+        from presence_automation import preview_window as pw
+
+        seen = []
+        handle = (
+            FakeWindow(), FakeImageView(), FakeLabel(),
+            FakePreviewController(data=bytes(10), text="At desk"),
+        )
+        handle[3].box = (4, 5, 6, 7)
+        original_draw = pw.draw_box
+
+        def spy(data, box, *a, **k):
+            seen.append(box)
+            return data
+
+        pw.draw_box = spy
+        try:
+            controller, _ = build(
+                status="Running (Present)",
+                preview_opener=lambda on_close=None: handle,
+            )
+            controller.on_toggle_preview()
+            controller.refresh()
+        finally:
+            pw.draw_box = original_draw
+        self.assertIn((4, 5, 6, 7), seen, "box never reached the renderer")
 
 
 if __name__ == "__main__":

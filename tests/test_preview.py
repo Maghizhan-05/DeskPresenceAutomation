@@ -1,6 +1,7 @@
 """Preview buffer + detector opt-in tests. No camera, no window server."""
 
 import os
+import subprocess
 import sys
 import unittest
 
@@ -329,6 +330,100 @@ class PreviewControllerTests(unittest.TestCase):
         data, _box, text = controller.tick()
         self.assertIsNone(data)
         self.assertEqual(text, WAITING_TEXT)
+
+
+class BoxRenderingTests(unittest.TestCase):
+    """Reviewer: the promised face box must actually reach the renderer."""
+
+    def test_clamp_rejects_absent_or_empty_box(self):
+        from presence_automation.preview_window import clamp_box
+
+        for bad in (None, (), (0, 0, 0, 0), (5, 5, 0, 10), (5, 5, 10, 0)):
+            self.assertIsNone(clamp_box(bad), "%r must be rejected" % (bad,))
+
+    def test_clamp_rejects_malformed_values(self):
+        from presence_automation.preview_window import clamp_box
+
+        for bad in ((1, 2, 3), ("a", "b", "c", "d"), (1, 2, 3, 4, 5)):
+            self.assertIsNone(clamp_box(bad), "%r must be rejected" % (bad,))
+
+    def test_clamp_clips_to_frame_bounds(self):
+        from presence_automation.preview_window import clamp_box
+
+        box = clamp_box((300, 220, 200, 200))
+        self.assertIsNotNone(box)
+        x, y, w, h = box
+        self.assertLessEqual(x + w, config.PREVIEW_WIDTH)
+        self.assertLessEqual(y + h, config.PREVIEW_HEIGHT)
+
+    def test_clamp_drops_box_fully_outside(self):
+        from presence_automation.preview_window import clamp_box
+
+        self.assertIsNone(clamp_box((9999, 9999, 50, 50)))
+
+    def test_draw_box_marks_green_pixels_at_the_rect(self):
+        from presence_automation.preview_window import draw_box
+
+        blank = bytes(pb.frame_bytes())
+        drawn = draw_box(blank, (10, 10, 40, 30))
+        self.assertNotEqual(drawn, blank, "box was not drawn")
+        self.assertEqual(len(drawn), len(blank), "frame size must not change")
+        stride = config.PREVIEW_WIDTH * 3
+        off = 10 * stride + 20 * 3          # a pixel on the top edge
+        self.assertEqual((drawn[off], drawn[off + 1], drawn[off + 2]), (0, 255, 0))
+
+    def test_draw_box_leaves_frame_untouched_when_box_invalid(self):
+        from presence_automation.preview_window import draw_box
+
+        blank = bytes(pb.frame_bytes())
+        self.assertEqual(draw_box(blank, (0, 0, 0, 0)), blank)
+        self.assertEqual(draw_box(blank, None), blank)
+
+    def test_draw_box_does_not_mutate_the_shared_buffer(self):
+        from presence_automation.preview_window import draw_box
+
+        original = bytes(pb.frame_bytes())
+        copy = bytes(original)
+        draw_box(original, (5, 5, 20, 20))
+        self.assertEqual(original, copy, "source frame must not be mutated")
+
+
+class CleanStderrTests(unittest.TestCase):
+    """Reviewer: shared-memory lifecycle must not print tracker tracebacks."""
+
+    def test_reader_in_owning_process_does_not_unregister(self):
+        name = "deskpresence_owned_%d" % os.getpid()
+        pb.unlink_stale(name)
+        writer = pb.PreviewWriter(name)
+        try:
+            self.assertTrue(pb.owns(name))
+            reader = pb.PreviewReader(name)
+            reader.close()
+            # Ownership survives a reader mapping in the same process.
+            self.assertTrue(pb.owns(name))
+        finally:
+            writer.close()
+            self.assertFalse(pb.owns(name))
+
+    def test_subprocess_lifecycle_has_clean_stderr(self):
+        """Full create/read/unlink cycle must emit nothing on stderr."""
+        code = (
+            "from presence_automation import preview_buffer as pb\n"
+            "w = pb.PreviewWriter('dp_stderr_probe')\n"
+            "w.write(bytes(pb.frame_bytes()), True, (1,2,3,4))\n"
+            "r = pb.PreviewReader('dp_stderr_probe')\n"
+            "r.read(); r.close(); w.close()\n"
+        )
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=repo, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stderr.strip(), "",
+            "shared-memory lifecycle printed to stderr:\n%s" % proc.stderr,
+        )
 
 
 if __name__ == "__main__":
