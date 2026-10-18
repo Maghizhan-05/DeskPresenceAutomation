@@ -245,7 +245,8 @@ a non-child process, and a recycled PID (later start time) is never signalled.
 ## Status reporting
 
 The worker rewrites `~/.local/state/deskpresence/heartbeat.json` atomically once
-per tick with `{state, present, pid, start_time, ts}`. The menu reads only that
+per tick with `{state, present, pid, start_time, ts}` plus countdowns and
+`detector_backend` (`vision` or `haar`, for live verification). The menu reads only that
 file, so it never presents stale presence as live: a heartbeat older than
 `HEARTBEAT_STALE_SECONDS`, one whose `pid`/`start_time` do not both match the
 tracked worker exactly, a heartbeat missing either identity field, or a corrupt
@@ -263,7 +264,7 @@ once the process is confirmed exited.
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 216 tests, no camera hardware
+./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 217 tests, no camera hardware
 ```
 
 - `tests/test_state_machine.py` (34) — the state machine is pure (no camera, no
@@ -287,7 +288,7 @@ once the process is confirmed exited.
 - `tests/test_menubar.py` (33) — menu structure, label/checkmark rendering for
   every status, and action wiring, with no GUI event loop; preview open/close
   never starts or stops the worker.
-- `tests/test_detector.py` (10) — Vision confidence gate, normalized lower-left
+- `tests/test_detector.py` (11) — Vision confidence gate, normalized lower-left
   to unmirrored top-left preview conversion, malformed observation handling,
   real in-memory Vision bridge without camera, backend selection, and
   per-sample confidence diagnostics.

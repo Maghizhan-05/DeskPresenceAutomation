@@ -138,6 +138,7 @@ def run(interval=None, max_ticks=None, detector=None):
                     ),
                     "absence_threshold": machine.absence_seconds,
                     "return_streak": machine.return_streak,
+                    "detector_backend": getattr(detector, "backend", "unknown"),
                     "preview": preview_on,
                 },
             )

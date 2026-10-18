@@ -111,6 +111,21 @@ class VisionResultTests(unittest.TestCase):
             self.assertEqual(main._self_test(), 0)
         self.assertEqual(sum('confidence=' in msg for msg in messages.output), 3)
 
+    def test_worker_heartbeat_reports_selected_backend(self):
+        from presence_automation import main
+        class FakeDetector:
+            backend = 'vision'
+            def sample(self, **_kwargs):
+                return False
+        beats = []
+        with patch.object(main, '_RUNNING', True), \
+             patch.object(main.worker_supervisor, 'preview_requested', return_value=False), \
+             patch.object(main.worker_supervisor, 'write_heartbeat', side_effect=lambda *a, **k: beats.append(k)), \
+             patch.object(main.worker_supervisor, 'clear_heartbeat'), \
+             patch.object(main.time, 'sleep'):
+            self.assertEqual(main.run(interval=0, max_ticks=1, detector=FakeDetector()), 0)
+        self.assertEqual(beats[0]['extra']['detector_backend'], 'vision')
+
     def test_real_sample_path_gates_confidence_and_preserves_preview_box(self):
         class Capture:
             def read(self):
