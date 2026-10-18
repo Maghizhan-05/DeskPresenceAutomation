@@ -178,15 +178,22 @@ a non-child process, and a recycled PID (later start time) is never signalled.
 ## Status reporting
 
 The worker rewrites `~/.local/state/deskpresence/heartbeat.json` atomically once
-per tick with `{state, present, pid, ts}`. The menu reads only that file, so it
-never presents stale presence as live: a heartbeat older than
-`HEARTBEAT_STALE_SECONDS`, a heartbeat from a different PID, or a corrupt file
-all render as `Unresponsive` (or `Starting…` during the startup grace).
+per tick with `{state, present, pid, start_time, ts}`. The menu reads only that
+file, so it never presents stale presence as live: a heartbeat older than
+`HEARTBEAT_STALE_SECONDS`, one whose `pid`/`start_time` do not both match the
+tracked worker exactly, a heartbeat missing either identity field, or a corrupt
+file all render as `Unresponsive` (or `Starting…` during the startup grace).
+
+Ownership of a worker this process spawned is additionally held in memory
+(`pid` + `start_time`), independent of the persisted file. A corrupted or
+deleted `menubar.json` therefore cannot orphan a running worker: Disable
+terminates that child through its own process handle and reports success only
+once the process is confirmed exited.
 
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 113 tests, no hardware
+./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 122 tests, no hardware
 ```
 
 - `tests/test_state_machine.py` (21) — the state machine is pure (no camera, no
@@ -197,11 +204,12 @@ all render as `Unresponsive` (or `Starting…` during the startup grace).
   records, mixed ownership.
 - `tests/test_spotify_control.py` (9) — ownership is never claimed (or is rolled
   back) when `open location` fails or Spotify never appears.
-- `tests/test_worker_supervisor.py` (49) — worker identity across restarts with
+- `tests/test_worker_supervisor.py` (58) — worker identity across restarts with
   fail-closed schema validation (invalid PID, missing/empty `start_time`,
-  non-dict or corrupt state), SIGTERM→SIGKILL escalation, heartbeat freshness
-  and identity matching, and `launchctl enable|disable` login-item handling
-  (asserting `bootout` is never used).
+  non-dict or corrupt state), direct `Popen` termination of our own child even
+  when persisted state is corrupted, SIGTERM→SIGKILL escalation, heartbeat
+  freshness and full-identity matching, and `launchctl enable|disable`
+  login-item handling (asserting `bootout` is never used).
 - `tests/test_menubar.py` (19) — menu structure, label/checkmark rendering for
   every status, and action wiring, with no GUI event loop.
 

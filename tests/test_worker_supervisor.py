@@ -74,9 +74,19 @@ class FakePopen(object):
     def __init__(self, world, pid):
         self.world = world
         self.pid = pid
+        self.terminate_calls = 0
+        self.kill_calls = 0
 
     def poll(self):
         return None if self.world.alive(self.pid) else 0
+
+    def terminate(self):
+        self.terminate_calls += 1
+        self.world.send_signal(self.pid, signal.SIGTERM)
+
+    def kill(self):
+        self.kill_calls += 1
+        self.world.send_signal(self.pid, signal.SIGKILL)
 
 
 class SupervisorTestCase(unittest.TestCase):
@@ -91,16 +101,23 @@ class SupervisorTestCase(unittest.TestCase):
         ws._popen = self.world.popen
         ws._signal = self.world.send_signal
         ws._process_identity = self.world.process_identity
-        ws._CHILD["popen"] = None
+        ws._clear_child()
 
     def tearDown(self):
         ws._popen, ws._signal, ws._process_identity, ws._run = self._orig
-        ws._CHILD["popen"] = None
+        ws._clear_child()
         config.MENUBAR_STATE_FILE, config.WORKER_HEARTBEAT_FILE = self._orig_paths
 
     def simulate_menubar_restart(self):
         """Drop the child handle: the worker is now a non-child process."""
-        ws._CHILD["popen"] = None
+        ws._clear_child()
+
+    def corrupt_state_losing_start_time(self):
+        """Persisted record loses start_time while our child is still alive."""
+        raw = ws._read_json(ws._state_path(), {})
+        worker = dict(raw.get("worker") or {})
+        worker.pop("start_time", None)
+        ws._atomic_write(ws._state_path(), {"enabled": True, "worker": worker})
 
 
 class StartStopTests(SupervisorTestCase):
@@ -320,6 +337,104 @@ class PidIdentityTests(SupervisorTestCase):
         self.assertEqual(self.world.signals, [])
 
 
+class StateCorruptionAfterStartTests(SupervisorTestCase):
+    """Reviewer's blocker: corrupted state must not orphan our live child."""
+
+    def test_disable_still_kills_our_child_when_start_time_is_lost(self):
+        ws.start_worker()
+        pid = ws.worker_pid()
+        self.assertIsNotNone(pid)
+        child = ws._CHILD["popen"]
+
+        self.corrupt_state_losing_start_time()
+        # Persisted identity is now unverifiable...
+        self.assertIsNone(ws._valid_worker_record(
+            ws._read_json(ws._state_path(), {}).get("worker")
+        ))
+        # ...but our own child is still tracked and still reported.
+        self.assertTrue(ws.is_worker_running())
+        self.assertEqual(ws.worker_pid(), pid)
+
+        self.assertTrue(ws.stop_worker(timeout=1.0))
+        self.assertGreaterEqual(child.terminate_calls, 1)   # actually signalled
+        self.assertFalse(self.world.alive(pid))             # actually exited
+        self.assertIsNone(ws._CHILD["popen"])
+        self.assertFalse(ws.is_worker_running())
+
+    def test_disable_reports_failure_while_our_child_survives(self):
+        ws.start_worker()
+        pid = ws.worker_pid()
+        self.world.procs[pid]["ignores_term"] = True
+        self.corrupt_state_losing_start_time()
+
+        # Make SIGKILL ineffective too, so the child cannot be stopped at all.
+        original = self.world.send_signal
+
+        def deaf(pid, sig):
+            self.world.signals.append((int(pid), sig))
+            return True
+
+        self.world.send_signal = deaf
+        ws._signal = deaf
+        try:
+            self.assertFalse(ws.stop_worker(timeout=0.4))   # no false success
+        finally:
+            self.world.send_signal = original
+            ws._signal = original
+        self.assertIsNotNone(ws._CHILD["popen"])            # handle retained
+        self.assertTrue(self.world.alive(pid))
+        self.assertTrue(ws.is_worker_running())             # still tracked
+
+        # And once it can be killed, Disable succeeds for real.
+        self.assertTrue(ws.stop_worker(timeout=1.0))
+        self.assertFalse(self.world.alive(pid))
+
+    def test_non_dict_state_does_not_orphan_our_child(self):
+        ws.start_worker()
+        pid = ws.worker_pid()
+        ws._atomic_write(ws._state_path(), {"enabled": True, "worker": "garbage"})
+        self.assertTrue(ws.is_worker_running())
+        self.assertEqual(ws.worker_pid(), pid)
+        self.assertTrue(ws.stop_worker(timeout=1.0))
+        self.assertFalse(self.world.alive(pid))
+
+    def test_deleted_state_file_does_not_orphan_our_child(self):
+        ws.start_worker()
+        pid = ws.worker_pid()
+        os.remove(ws._state_path())
+        self.assertTrue(ws.is_worker_running())
+        self.assertEqual(ws.worker_pid(), pid)
+        self.assertTrue(ws.stop_worker(timeout=1.0))
+        self.assertFalse(self.world.alive(pid))
+
+    def test_child_sigkill_escalation_via_popen(self):
+        ws.start_worker()
+        pid = ws.worker_pid()
+        child = ws._CHILD["popen"]
+        self.world.procs[pid]["ignores_term"] = True
+        self.corrupt_state_losing_start_time()
+        self.assertTrue(ws.stop_worker(timeout=0.4))
+        self.assertGreaterEqual(child.terminate_calls, 1)
+        self.assertGreaterEqual(child.kill_calls, 1)
+        self.assertFalse(self.world.alive(pid))
+
+    def test_corrupted_state_with_live_child_still_shows_running(self):
+        ws.start_worker()
+        pid = ws.worker_pid()
+        start_time = ws._CHILD["start_time"]
+        self.corrupt_state_losing_start_time()
+        ws._atomic_write(
+            ws._heartbeat_path(),
+            {
+                "present": True,
+                "pid": pid,
+                "start_time": start_time,
+                "ts": time.time(),
+            },
+        )
+        self.assertEqual(ws.worker_status(), "Running (Present)")
+
+
 class StatusTests(SupervisorTestCase):
     def _age_out_startup_grace(self):
         """Pretend the worker started long ago, so startup grace no longer applies."""
@@ -330,13 +445,17 @@ class StatusTests(SupervisorTestCase):
         )
         ws.save_state(state["enabled"], worker)
 
-    def _beat(self, present, age=0.0, pid=None, state="present"):
+    def _beat(self, present, age=0.0, pid=None, state="present", start_time=-1):
+        """Write a heartbeat. Defaults carry FULL identity (pid + start_time)."""
+        if start_time == -1:
+            start_time = ws._tracked_start_time()
         ws._atomic_write(
             ws._heartbeat_path(),
             {
                 "state": state,
                 "present": present,
                 "pid": pid if pid is not None else ws.worker_pid(),
+                "start_time": start_time,
                 "ts": time.time() - age,
             },
         )
@@ -411,6 +530,42 @@ class StatusTests(SupervisorTestCase):
             ws._heartbeat_path(), {"present": True, "ts": time.time()}
         )
         self.assertEqual(ws.worker_status(), "Unresponsive")
+
+    def test_heartbeat_with_pid_and_ts_but_no_start_time_is_not_live(self):
+        """Full identity is mandatory: pid + ts alone must not show Running."""
+        ws.start_worker()
+        self._age_out_startup_grace()
+        ws._atomic_write(
+            ws._heartbeat_path(),
+            {"present": True, "pid": ws.worker_pid(), "ts": time.time()},
+        )
+        self.assertEqual(ws.worker_status(), "Unresponsive")
+
+    def test_missing_or_empty_heartbeat_start_time_matrix(self):
+        ws.start_worker()
+        self._age_out_startup_grace()
+        pid = ws.worker_pid()
+        for bad in (None, "", "   ", 12345, 0, True, [], {}):
+            ws._atomic_write(
+                ws._heartbeat_path(),
+                {
+                    "present": True,
+                    "pid": pid,
+                    "start_time": bad,
+                    "ts": time.time(),
+                },
+            )
+            self.assertEqual(
+                ws.worker_status(),
+                "Unresponsive",
+                "start_time=%r must never render Running" % (bad,),
+            )
+
+    def test_full_identity_heartbeat_is_the_only_live_path(self):
+        ws.start_worker()
+        self._age_out_startup_grace()
+        self._beat(True)   # helper now includes pid AND start_time
+        self.assertEqual(ws.worker_status(), "Running (Present)")
 
     def test_nonnumeric_ts_does_not_raise(self):
         ws.start_worker()

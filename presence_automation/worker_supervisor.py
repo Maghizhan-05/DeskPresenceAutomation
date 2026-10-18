@@ -188,6 +188,33 @@ def clear_heartbeat():
         pass
 
 
+# --- liveness ----------------------------------------------------------------
+# Trusted in-memory identity for the child WE spawned in this process. This is
+# authoritative and independent of the persisted file: a corrupted menubar.json
+# must never make us lose track of (or fail to terminate) our own live child.
+_CHILD = {"popen": None, "pid": None, "start_time": None}  # type: dict
+
+
+def _child_if_alive():
+    """The Popen we own if it is still running, else None (and the slot clears)."""
+    child = _CHILD["popen"]
+    if child is None:
+        return None
+    try:
+        if child.poll() is None:
+            return child
+    except OSError:
+        return None
+    _clear_child()  # reaped
+    return None
+
+
+def _clear_child():
+    _CHILD["popen"] = None
+    _CHILD["pid"] = None
+    _CHILD["start_time"] = None
+
+
 def _valid_heartbeat(beat):
     """Normalised heartbeat, or None when the payload cannot be trusted.
 
@@ -204,7 +231,9 @@ def _valid_heartbeat(beat):
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return None
     start_time = beat.get("start_time")
-    if start_time is not None and not isinstance(start_time, str):
+    # Full identity is mandatory: without a nonempty start_time a heartbeat
+    # cannot be tied to the tracked worker, so it can never show "Running".
+    if not isinstance(start_time, str) or not start_time.strip():
         return None
     return {
         "ts": float(ts),
@@ -250,21 +279,35 @@ def _identity_matches(worker):
 
 
 def is_worker_running():
-    """Liveness without ever signalling an unverified PID."""
-    child = _CHILD["popen"]
-    if child is not None:
-        if child.poll() is None:
-            return True
-        _CHILD["popen"] = None  # reaped; fall through to the persisted record
+    """Liveness without ever signalling an unverified PID.
+
+    Our own live child counts regardless of what the persisted file says.
+    """
+    if _child_if_alive() is not None:
+        return True
     return _identity_matches(load_state()["worker"])
 
 
 def worker_pid():
-    state = load_state()
-    worker = state["worker"]
+    """PID of the worker we can prove we own, or None.
+
+    The trusted in-memory child wins over the persisted record, so corrupted
+    state cannot make us lose the PID of a child we spawned ourselves.
+    """
+    if _child_if_alive() is not None and _CHILD["pid"]:
+        return int(_CHILD["pid"])
+    worker = load_state()["worker"]
     if worker and _identity_matches(worker):
         return int(worker["pid"])
     return None
+
+
+def _tracked_start_time():
+    """start_time of the worker we are tracking (in-memory first), or None."""
+    if _child_if_alive() is not None and _CHILD["start_time"]:
+        return _CHILD["start_time"]
+    worker = load_state()["worker"]
+    return worker["start_time"] if worker else None
 
 
 def worker_status():
@@ -292,14 +335,12 @@ def worker_status():
         return degraded
     if tracked is None:
         return degraded
-    # The heartbeat must belong to the exact worker we are tracking.
+    # The heartbeat must belong to the exact worker we are tracking: same PID
+    # AND same start_time. Both are mandatory before any "Running" label.
     if beat["pid"] != tracked:
         return degraded
-    record = load_state()["worker"]
-    if record is None or (
-        beat["start_time"] is not None
-        and beat["start_time"] != record["start_time"]
-    ):
+    tracked_start = _tracked_start_time()
+    if not tracked_start or beat["start_time"] != tracked_start:
         return degraded
     return "Running (Present)" if beat["present"] else "Running (Away)"
 
@@ -334,6 +375,8 @@ def start_worker():
         return False
 
     _CHILD["popen"] = child
+    _CHILD["pid"] = int(child.pid)
+    _CHILD["start_time"] = identity[0]
     save_state(
         True,
         {
@@ -346,6 +389,33 @@ def start_worker():
     return True
 
 
+def _terminate_child(child, timeout):
+    """Terminate OUR Popen directly. True only once it is confirmed exited.
+
+    This path does not consult the persisted file at all: a corrupted
+    menubar.json must never prevent us from stopping a child we own.
+    """
+    try:
+        child.terminate()
+    except OSError:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if child.poll() is not None:
+            return True
+        time.sleep(0.2)
+    try:
+        child.kill()
+    except OSError:
+        pass
+    hard_deadline = time.time() + timeout
+    while time.time() < hard_deadline:
+        if child.poll() is not None:
+            return True
+        time.sleep(0.2)
+    return child.poll() is not None
+
+
 def stop_worker(timeout=None):
     """SIGTERM, then SIGKILL after the grace window. True once no worker lives.
 
@@ -355,9 +425,21 @@ def stop_worker(timeout=None):
     if timeout is None:
         timeout = config.WORKER_STOP_GRACE_SECONDS
 
+    # 1. A child we own is handled through its Popen, ignoring persisted state.
+    child = _child_if_alive()
+    if child is not None:
+        if not _terminate_child(child, timeout):
+            # Still alive: never report success and never drop the handle.
+            return False
+        _clear_child()
+        save_state(False, None)
+        clear_heartbeat()
+        return True
+
+    # 2. Otherwise only a fully verified persisted identity may be signalled.
     pid = worker_pid()
     if pid is None:
-        _CHILD["popen"] = None
+        _clear_child()
         save_state(False, None)
         clear_heartbeat()
         return True
@@ -377,7 +459,7 @@ def stop_worker(timeout=None):
 
     stopped = not is_worker_running()
     if stopped:
-        _CHILD["popen"] = None
+        _clear_child()
         save_state(False, None)
         clear_heartbeat()
     return stopped
