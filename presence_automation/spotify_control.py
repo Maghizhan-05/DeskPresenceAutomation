@@ -42,30 +42,35 @@ def is_running():
 def play_configured_item(uri=None, settle_seconds=2.0):
     """Open the configured album/playlist URI. Returns True on success.
 
-    If Spotify was not already running, its launch is recorded in the session
-    file so `close_tracked()` is allowed to quit it later.
+    Ownership of Spotify is claimed only if we actually cold-started it AND a
+    new PID appears -- never before the launch succeeds. On failure any
+    speculative claim is rolled back, so a later user-opened Spotify can never
+    be treated as ours.
     """
     if uri is None:
         uri = config.SPOTIFY_URI
-    was_running = is_running()
 
-    if not was_running:
-        session = app_manager._load_session()
-        if config.SPOTIFY_BUNDLE_ID not in {
-            entry["bundle_id"] for entry in session["launched"]
-        }:
-            session["launched"].append(
-                {"bundle_id": config.SPOTIFY_BUNDLE_ID, "launched_at": time.time()}
-            )
-            app_manager._save_session(session)
+    existing = app_manager.running_pids(config.SPOTIFY_BUNDLE_ID)
+    was_running = bool(existing)
 
     result = _osascript('open location "%s"' % uri)
     if result.returncode != 0:
+        if not was_running:
+            app_manager.release_ownership(config.SPOTIFY_BUNDLE_ID)
         return False
 
     if not was_running:
         # Give a cold-started Spotify a moment before issuing transport control.
         time.sleep(settle_seconds)
+        pid = app_manager._await_new_pid(
+            config.SPOTIFY_BUNDLE_ID,
+            existing,
+            time.time() + app_manager.LAUNCH_GRACE_SECONDS,
+        )
+        if pid is None:
+            app_manager.release_ownership(config.SPOTIFY_BUNDLE_ID)
+            return False
+        app_manager.record_ownership(config.SPOTIFY_BUNDLE_ID, pid)
 
     # `open location` already starts playback. The explicit play is best-effort
     # insurance for the paused-on-open case; a timeout here (e.g. the Apple

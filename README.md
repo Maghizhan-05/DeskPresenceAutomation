@@ -95,21 +95,36 @@ Bundle IDs verified on this machine: ChatGPT.app is `com.openai.codex` (not
 
 ## How the "don't touch my apps" guard works
 
-`launch_tracked()` reads the running-app list first. An app that is **already
-running** is skipped and never recorded, so `close_tracked()` — which quits only
-what is in the session file — can never quit it. Spotify gets the same
-treatment: on departure the automation only *pauses* playback; it quits Spotify
-only if it was the one that started it.
+Ownership is per **process instance**, not per bundle ID.
+
+1. `launch_tracked()` skips any app that already has a running PID — that is the
+   user's instance, and it is never recorded.
+2. For an app it does start, it waits for a PID that was not running before the
+   launch and records *that exact PID*. If the launch fails or no new PID ever
+   appears, nothing is claimed.
+3. `close_tracked()` terminates only a recorded `(bundle_id, pid)` pair that is
+   still alive and still owned by that bundle. If our instance exited and the
+   user later opened the app, the replacement has a different PID, so the record
+   is silently discarded and the user's app is left alone. A PID recycled by a
+   different app is likewise never touched.
+
+Spotify follows the same rule, and on departure the automation only *pauses*
+playback — it quits Spotify only if it cold-started it itself.
 
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest discover -s tests -v   # 21 tests, no hardware
+./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 45 tests, no hardware
 ```
 
-The state machine is pure (no camera, no subprocess, no clock reads — the caller
-passes each sample plus its timestamp), so every debounce, absence, and cooldown
-edge is tested deterministically.
+- `tests/test_state_machine.py` (21) — the state machine is pure (no camera, no
+  subprocess, no clock reads; the caller passes each sample plus its timestamp),
+  so every debounce, absence, and cooldown edge is deterministic.
+- `tests/test_app_manager.py` (15) — PID ownership against a fake process table:
+  user-opened replacements, PID reuse, failed launches, failed quits, legacy
+  records, mixed ownership.
+- `tests/test_spotify_control.py` (9) — ownership is never claimed (or is rolled
+  back) when `open location` fails or Spotify never appears.
 
 ## Layout
 
@@ -118,9 +133,11 @@ presence_automation/
   config.py           constants only, no I/O
   state_machine.py    pure IDLE/ARRIVING/PRESENT/LEAVING/COOLDOWN machine
   detector.py         one webcam frame -> bool, nothing retained
-  app_manager.py      launch/quit with the already-running guard
+  app_manager.py      launch/quit with per-PID ownership
   spotify_control.py  spotify: URI playback + pause
   main.py             loop; side effects on transition edges only
 tests/test_state_machine.py
+tests/test_app_manager.py
+tests/test_spotify_control.py
 launchd/com.user.deskpresence.plist
 ```

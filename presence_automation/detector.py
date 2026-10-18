@@ -25,7 +25,11 @@ def _haar_cascade_path():
 
 
 class Detector:
-    def __init__(self, camera_index=config.CAMERA_INDEX):
+    def __init__(self, camera_index=None):
+        # Resolved at construction time, not at def time, so a config change
+        # (or a test override) is honoured instead of frozen at import.
+        if camera_index is None:
+            camera_index = config.CAMERA_INDEX
         self.camera_index = camera_index
         self._capture = None
         self._cascade = cv2.CascadeClassifier(_haar_cascade_path())
