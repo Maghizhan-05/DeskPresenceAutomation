@@ -47,6 +47,7 @@ A **DP** item appears in the menu bar. Clicking it shows:
 | --- | --- |
 | `Status: …` | `Stopped`, `Starting…`, `Running (Present)`, `Running (Away)`, or `Unresponsive`. Not clickable. |
 | `Enable Automation` / `Disable Automation` | Starts or stops the background worker. A checkmark shows it is running. |
+| `Show Camera Preview` | Opens a small window showing what the camera sees plus the live absence countdown. Off by default; see below. |
 | `Launch at Login` | Checkmark = the menu-bar app starts automatically at login. |
 | `Quit` | Exits the menu-bar app, stopping the worker first so nothing is left using the camera. |
 
@@ -66,6 +67,44 @@ project is running and the camera is untouched. The menu-bar process itself
 stays alive (that is how the menu stays available) but it **never opens the
 camera** — only the worker does — so there is exactly one camera permission to
 approve, not two.
+
+### Camera preview (opt-in)
+
+**Show Camera Preview** opens a small window with the live camera image, a box
+around a detected face, and a status line such as
+`Away - closing apps in 18s`. It is **off by default** and must be turned on
+explicitly each time; closing the window stops the preview but never stops the
+automation.
+
+How it stays private:
+
+* The worker copies a downscaled (320×240) frame into a **fixed-size** block of
+  shared memory, overwritten in place every tick. It never grows, never
+  appends, and holds exactly one frame.
+* Nothing is written to disk, encoded to an image file, or sent anywhere. The
+  menu-bar process maps that same block read-only and blits it to the screen.
+* The block is destroyed when the preview is switched off, when the worker
+  stops, and when the app quits. A segment left by a crashed worker is unlinked
+  and recreated rather than reused, so no frame outlives the worker.
+* Turning preview on does not change detection: the frame is published **after**
+  inference, so the presence result is identical either way.
+
+**The honest privacy trade-off:** with preview off, no image of you exists
+anywhere outside the worker's momentary memory — it cannot be screenshotted or
+screen-shared because nothing is ever drawn. Turning preview on renders your
+camera feed to your own screen, which means screen-recording or screen-sharing
+software could now capture it. It is still never saved or transmitted by this
+app, but the on-screen window is a new (small, local, opt-in) surface that did
+not exist before.
+
+### How the 30-second departure works
+
+Arrival needs 3 consecutive positive samples, and the return path is debounced
+the same way: once the absence countdown is running, **3 consecutive positive
+samples** are needed to cancel it. A single false-positive frame — background
+clutter, a photo, a reflection — no longer resets the timer, and it does not
+rewind absence already accrued. Without this, a lone stray detection reset the
+whole 30s window and departure never fired.
 
 ### Launch at Login
 
@@ -196,25 +235,34 @@ once the process is confirmed exited.
 ## Tests
 
 ```bash
-./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 126 tests, no hardware
+./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 183 tests, no hardware
 ```
 
-- `tests/test_state_machine.py` (21) — the state machine is pure (no camera, no
+- `tests/test_state_machine.py` (34) — the state machine is pure (no camera, no
   subprocess, no clock reads; the caller passes each sample plus its timestamp),
-  so every debounce, absence, and cooldown edge is deterministic.
+  so every debounce, absence, and cooldown edge is deterministic. Includes the
+  return-debounce regressions: a stray positive cannot cancel or rewind an
+  absence countdown, and a replay of the real logged flicker pattern must reach
+  `DEPARTED`.
 - `tests/test_app_manager.py` (15) — PID ownership against a fake process table:
   user-opened replacements, PID reuse, failed launches, failed quits, legacy
   records, mixed ownership.
 - `tests/test_spotify_control.py` (9) — ownership is never claimed (or is rolled
   back) when `open location` fails or Spotify never appears.
-- `tests/test_worker_supervisor.py` (62) — worker identity across restarts with
+- `tests/test_worker_supervisor.py` (68) — worker identity across restarts with
   fail-closed schema validation (invalid PID, missing/empty `start_time`,
   non-dict or corrupt state), direct `Popen` termination of our own child even
   when persisted state is corrupted, SIGTERM→SIGKILL escalation, heartbeat
-  freshness and full-identity matching, and `launchctl enable|disable`
-  login-item handling (asserting `bootout` is never used).
-- `tests/test_menubar.py` (19) — menu structure, label/checkmark rendering for
-  every status, and action wiring, with no GUI event loop.
+  freshness and full-identity matching, preview request/segment cleanup on stop,
+  and `launchctl enable|disable` login-item handling (asserting `bootout` is
+  never used).
+- `tests/test_menubar.py` (26) — menu structure, label/checkmark rendering for
+  every status, and action wiring, with no GUI event loop; preview open/close
+  never starts or stops the worker.
+- `tests/test_preview.py` (31) — shared-memory lifecycle (fixed size across 200
+  writes, overwrite-in-place, unlink on close, stale segment from a crashed
+  worker is replaced), the preview-off default touching no buffer, identical
+  detection results with preview on and off, and countdown text rendering.
 
 ## Layout
 
@@ -228,11 +276,14 @@ presence_automation/
   main.py               loop; side effects on transition edges only
   worker_supervisor.py  worker process lifecycle + login item + heartbeat
   menubar.py            rumps status item; no camera, no process logic
+  preview_buffer.py     fixed-size shared-memory slot, one frame, in place
+  preview_window.py     opt-in preview window + countdown text
 tests/test_state_machine.py
 tests/test_app_manager.py
 tests/test_spotify_control.py
 tests/test_worker_supervisor.py
 tests/test_menubar.py
+tests/test_preview.py
 launchd/com.user.deskpresence.menubar.plist   menu bar (recommended)
 launchd/com.user.deskpresence.plist           headless (advanced)
 ```

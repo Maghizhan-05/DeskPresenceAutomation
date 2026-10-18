@@ -71,20 +71,70 @@ class FakeSupervisor(object):
         return {"enabled": self.enabled, "worker": None}
 
 
-def build(status="Stopped", login=False, enabled=False):
+def build(status="Stopped", login=False, enabled=False, preview_opener=None):
     supervisor = FakeSupervisor(status=status, login=login, enabled=enabled)
     quit_calls = []
     controller = menubar.DeskPresenceMenuBar(
         app=FakeApp(),
         supervisor=supervisor,  # type: ignore[arg-type]
         quit_hook=lambda: quit_calls.append(True),
+        preview_opener=preview_opener,
     )
     controller.quit_calls = quit_calls
     return controller, supervisor
 
 
+class FakeWindow(object):
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class FakeImageView(object):
+    def __init__(self):
+        self.images = []
+
+    def setImage_(self, image):
+        self.images.append(image)
+
+
+class FakeLabel(object):
+    def __init__(self):
+        self.text = None
+
+    def setStringValue_(self, value):
+        self.text = value
+
+
+class FakePreviewController(object):
+    def __init__(self, data=None, text="At desk"):
+        self.data = data
+        self.text = text
+        self.closed = False
+        self.ticks = 0
+
+    def tick(self):
+        self.ticks += 1
+        return self.data, (0, 0, 0, 0), self.text
+
+    def close(self):
+        self.closed = True
+
+
+def fake_preview_handle(data=None, text="At desk"):
+    """Mimic show_window()'s (window, image_view, label, controller) tuple."""
+    return (
+        FakeWindow(),
+        FakeImageView(),
+        FakeLabel(),
+        FakePreviewController(data=data, text=text),
+    )
+
+
 class MenuStructureTests(unittest.TestCase):
-    def test_menu_has_status_toggle_login_and_quit(self):
+    def test_menu_has_status_toggle_preview_login_and_quit(self):
         controller, _ = build()
         titles = [
             item.title for item in controller.app.menu if item is not None
@@ -94,6 +144,7 @@ class MenuStructureTests(unittest.TestCase):
             [
                 "Status: Stopped",
                 menubar.ENABLE_LABEL,
+                menubar.PREVIEW_LABEL,
                 menubar.LOGIN_LABEL,
                 menubar.QUIT_LABEL,
             ],
@@ -225,6 +276,76 @@ class AutostartTests(unittest.TestCase):
         controller, supervisor = build(status="Running (Away)", enabled=True)
         controller.autostart_if_enabled()
         self.assertEqual(supervisor.calls, [])
+
+
+class PreviewMenuTests(unittest.TestCase):
+    def test_preview_is_closed_by_default(self):
+        controller, _ = build(status="Running (Present)")
+        self.assertEqual(controller.preview_item.state, 0)
+        self.assertIsNone(controller._preview)
+
+    def test_opening_preview_sets_checkmark_and_never_touches_worker(self):
+        handle = fake_preview_handle()
+        controller, supervisor = build(
+            status="Running (Present)", preview_opener=lambda: handle
+        )
+        supervisor.calls = []
+        controller.on_toggle_preview()
+        self.assertEqual(controller.preview_item.state, 1)
+        self.assertEqual(
+            supervisor.calls, [], "preview must not start/stop the worker"
+        )
+
+    def test_closing_preview_clears_checkmark_and_leaves_worker_running(self):
+        handle = fake_preview_handle()
+        controller, supervisor = build(
+            status="Running (Present)", preview_opener=lambda: handle
+        )
+        controller.on_toggle_preview()
+        supervisor.calls = []
+        controller.on_toggle_preview()
+        self.assertEqual(controller.preview_item.state, 0)
+        self.assertTrue(handle[3].closed, "controller.close() must be called")
+        self.assertTrue(handle[0].closed, "window must be closed")
+        self.assertEqual(supervisor.calls, [])
+        self.assertTrue(supervisor.is_worker_running())
+
+    def test_refresh_redraws_an_open_preview(self):
+        handle = fake_preview_handle(data=b"frame", text="Away - closing apps in 7s")
+        controller, _ = build(
+            status="Running (Away)", preview_opener=lambda: handle
+        )
+        controller.on_toggle_preview()
+        before = handle[3].ticks
+        controller.refresh()
+        self.assertGreater(handle[3].ticks, before, "refresh must pull a frame")
+        self.assertEqual(handle[2].text, "Away - closing apps in 7s")
+
+    def test_refresh_without_preview_does_not_tick(self):
+        controller, _ = build(status="Running (Present)")
+        self.assertFalse(controller.redraw_preview())
+
+    def test_preview_open_failure_does_not_break_the_menu(self):
+        def boom():
+            raise RuntimeError("no window server")
+
+        controller, _ = build(status="Running (Present)", preview_opener=boom)
+        status = controller.on_toggle_preview()
+        self.assertEqual(status, "Running (Present)")
+        self.assertIsNone(controller._preview)
+        self.assertEqual(controller.preview_item.state, 0)
+
+    def test_quit_closes_the_preview_before_stopping_the_worker(self):
+        handle = fake_preview_handle()
+        controller, supervisor = build(
+            status="Running (Present)", preview_opener=lambda: handle
+        )
+        controller.on_toggle_preview()
+        controller.on_quit()
+        self.assertTrue(handle[3].closed)
+        self.assertTrue(handle[0].closed)
+        self.assertEqual(supervisor.calls, ["stop"])
+        self.assertEqual(len(controller.quit_calls), 1)
 
 
 if __name__ == "__main__":

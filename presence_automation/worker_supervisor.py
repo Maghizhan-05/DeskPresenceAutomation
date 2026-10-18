@@ -164,21 +164,22 @@ def discard_invalid_state():
 
 
 # --- heartbeat (written by the worker, read by the menu) ---------------------
-def write_heartbeat(state, present):
+def write_heartbeat(state, present, extra=None):
     """Called once per tick by the worker. Atomic: readers never see a partial."""
     pid = os.getpid()
     identity = _process_identity(pid)
-    _atomic_write(
-        _heartbeat_path(),
-        {
-            "state": state,
-            "present": bool(present),
-            "pid": pid,
-            "start_time": identity[0] if identity else None,
-            "comm": identity[1] if identity else None,
-            "ts": time.time(),
-        },
-    )
+    payload = {
+        "state": state,
+        "present": bool(present),
+        "pid": pid,
+        "start_time": identity[0] if identity else None,
+        "comm": identity[1] if identity else None,
+        "ts": time.time(),
+    }
+    if extra:
+        # Countdown fields for the preview/menu. Never image data.
+        payload.update(extra)
+    _atomic_write(_heartbeat_path(), payload)
 
 
 def clear_heartbeat():
@@ -255,6 +256,33 @@ def heartbeat_exists():
     untrustworthy" (Unresponsive).
     """
     return os.path.exists(_heartbeat_path())
+
+
+# --- preview request (menu writes, worker polls) -----------------------------
+def _preview_path():
+    return os.path.expanduser(config.PREVIEW_REQUEST_FILE)
+
+
+def set_preview_requested(enabled):
+    """Ask the worker to publish preview frames. Opt-in, off by default."""
+    _atomic_write(_preview_path(), {"preview": bool(enabled)})
+    return bool(enabled)
+
+
+def preview_requested():
+    """True only if the menu explicitly asked for preview. Fails closed."""
+    data = _read_json(_preview_path(), None)
+    if not isinstance(data, dict):
+        return bool(config.PREVIEW_ENABLED_DEFAULT)
+    return bool(data.get("preview", config.PREVIEW_ENABLED_DEFAULT))
+
+
+def clear_preview_request():
+    try:
+        os.remove(_preview_path())
+        return True
+    except OSError:
+        return False
 
 
 # --- liveness ----------------------------------------------------------------
@@ -424,6 +452,22 @@ def _terminate_child(child, timeout):
     return child.poll() is not None
 
 
+def _cleanup_after_stop():
+    """Everything that must not outlive the worker process."""
+    _clear_child()
+    save_state(False, None)
+    clear_heartbeat()
+    clear_preview_request()
+    # Destroy the preview shared-memory segment: no frame data may survive
+    # the worker, including after a crash.
+    try:
+        from . import preview_buffer
+
+        preview_buffer.unlink_stale()
+    except Exception:
+        pass
+
+
 def stop_worker(timeout=None):
     """SIGTERM, then SIGKILL after the grace window. True once no worker lives.
 
@@ -439,17 +483,13 @@ def stop_worker(timeout=None):
         if not _terminate_child(child, timeout):
             # Still alive: never report success and never drop the handle.
             return False
-        _clear_child()
-        save_state(False, None)
-        clear_heartbeat()
+        _cleanup_after_stop()
         return True
 
     # 2. Otherwise only a fully verified persisted identity may be signalled.
     pid = worker_pid()
     if pid is None:
-        _clear_child()
-        save_state(False, None)
-        clear_heartbeat()
+        _cleanup_after_stop()
         return True
 
     _signal(pid, signal.SIGTERM)
@@ -467,9 +507,7 @@ def stop_worker(timeout=None):
 
     stopped = not is_worker_running()
     if stopped:
-        _clear_child()
-        save_state(False, None)
-        clear_heartbeat()
+        _cleanup_after_stop()
     return stopped
 
 

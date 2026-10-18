@@ -78,18 +78,43 @@ def run(interval=None, max_ticks=None, detector=None):
     )
 
     ticks = 0
+    preview_writer = None
+    preview_on = False
     try:
         while _RUNNING and (max_ticks is None or ticks < max_ticks):
             ticks += 1
+
+            # Opt-in preview: the menu writes the request file, we pick it up.
+            wanted = worker_supervisor.preview_requested()
+            if wanted and not preview_on:
+                try:
+                    from .preview_buffer import PreviewWriter
+
+                    preview_writer = PreviewWriter()
+                    preview_on = True
+                    LOG.info("preview buffer opened (in-memory only)")
+                except Exception as exc:
+                    LOG.warning("preview unavailable: %s", exc)
+                    preview_writer = None
+                    preview_on = False
+            elif not wanted and preview_on:
+                _close_preview(preview_writer)
+                preview_writer = None
+                preview_on = False
+                LOG.info("preview buffer closed and unlinked")
+
             try:
-                present = detector.sample()
+                present = detector.sample(
+                    publish_preview=preview_on, preview_writer=preview_writer
+                )
             except DetectorUnavailable as exc:
                 LOG.error("detector error: %s", exc)
                 time.sleep(interval)
                 continue
 
             previous = machine.state
-            event = machine.update(present, time.monotonic())
+            now = time.monotonic()
+            event = machine.update(present, now)
             if machine.state is not previous:
                 LOG.debug("%s -> %s (present=%s)", previous.value, machine.state.value, present)
 
@@ -99,15 +124,42 @@ def run(interval=None, max_ticks=None, detector=None):
                 on_departed()
 
             # Liveness + presence for the menu bar. Atomic, one write per tick.
-            worker_supervisor.write_heartbeat(machine.state.value, present)
+            # The countdowns come from the state machine so the menu and the
+            # preview share one source of truth (no second polling loop).
+            worker_supervisor.write_heartbeat(
+                machine.state.value,
+                present,
+                extra={
+                    "absence_seconds_remaining": round(
+                        machine.absence_remaining(now), 1
+                    ),
+                    "cooldown_seconds_remaining": round(
+                        machine.cooldown_remaining(now), 1
+                    ),
+                    "absence_threshold": machine.absence_seconds,
+                    "return_streak": machine.return_streak,
+                    "preview": preview_on,
+                },
+            )
 
             time.sleep(interval)
     finally:
+        _close_preview(preview_writer)
         if owns_detector:
             detector.close()
         worker_supervisor.clear_heartbeat()
         LOG.info("stopped after %s samples", ticks)
     return 0
+
+
+def _close_preview(writer):
+    """Destroy the preview segment so no frame data outlives the worker."""
+    if writer is None:
+        return
+    try:
+        writer.close(unlink=True)
+    except Exception:
+        pass
 
 
 def main(argv=None):

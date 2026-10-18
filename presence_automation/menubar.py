@@ -30,6 +30,7 @@ DEFAULT_SHORT_TITLE = "DP on"
 STATUS_PREFIX = "Status: "
 ENABLE_LABEL = "Enable Automation"
 DISABLE_LABEL = "Disable Automation"
+PREVIEW_LABEL = "Show Camera Preview"
 LOGIN_LABEL = "Launch at Login"
 QUIT_LABEL = "Quit"
 
@@ -45,9 +46,13 @@ class DeskPresenceMenuBar(object):
     without a GUI event loop.
     """
 
-    def __init__(self, app=None, supervisor=worker_supervisor, quit_hook=None):
+    def __init__(self, app=None, supervisor=worker_supervisor, quit_hook=None,
+                 preview_opener=None):
         self.supervisor = supervisor
         self._injected_app = app is not None
+        # Injectable so tests never open a real window server connection.
+        self._preview_opener = preview_opener
+        self._preview = None
         # Only a real rumps.App may terminate the GUI event loop; tests inject
         # a fake app and a no-op hook so Quit never calls NSApplication.
         if quit_hook is not None:
@@ -78,12 +83,14 @@ class DeskPresenceMenuBar(object):
     def _build_menu(self):
         self.status_item = self._item(STATUS_PREFIX + "...")  # no callback = greyed
         self.toggle_item = self._item(ENABLE_LABEL, callback=self.on_toggle)
+        self.preview_item = self._item(PREVIEW_LABEL, callback=self.on_toggle_preview)
         self.login_item = self._item(LOGIN_LABEL, callback=self.on_toggle_login)
         self.quit_item = self._item(QUIT_LABEL, callback=self.on_quit)
         self.app.menu = [
             self.status_item,
             None,
             self.toggle_item,
+            self.preview_item,
             self.login_item,
             None,
             self.quit_item,
@@ -98,8 +105,28 @@ class DeskPresenceMenuBar(object):
         self.toggle_item.title = DISABLE_LABEL if running else ENABLE_LABEL
         self.toggle_item.state = 1 if running else 0
         self.login_item.state = 1 if self.supervisor.is_login_item_enabled() else 0
+        # Preview is only meaningful while a worker is producing frames.
+        self.preview_item.state = 1 if self._preview is not None else 0
         self.app.title = _short_title(status)
+        self.redraw_preview()
         return status
+
+    def redraw_preview(self):
+        """Pull one frame into the open preview window, if any. No-op if closed."""
+        handle = self._preview
+        if not isinstance(handle, tuple) or len(handle) < 4:
+            return False
+        _window, image_view, label, controller = handle[:4]
+        try:
+            data, box, text = controller.tick()
+            label.setStringValue_(text)
+            if data is not None:
+                from .preview_window import frame_to_nsimage
+
+                image_view.setImage_(frame_to_nsimage(data))
+            return True
+        except Exception:
+            return False
 
     # -- actions -----------------------------------------------------------
     def on_toggle(self, _sender=None):
@@ -118,8 +145,45 @@ class DeskPresenceMenuBar(object):
             self.supervisor.enable_login_item()
         return self.refresh()
 
+    def on_toggle_preview(self, _sender=None):
+        """Open/close the opt-in preview. Never starts or stops the worker."""
+        if self._preview is not None:
+            self._close_preview()
+            return self.refresh()
+        opener = self._preview_opener
+        if opener is None:
+            from .preview_window import show_window
+
+            opener = show_window
+        try:
+            self._preview = opener()
+        except Exception:
+            # A preview failure must never take the menu down.
+            self._preview = None
+        return self.refresh()
+
+    def _close_preview(self):
+        handle = self._preview
+        self._preview = None
+        if handle is None:
+            return
+        # show_window returns (window, image_view, label, controller).
+        controller = handle[3] if isinstance(handle, tuple) and len(handle) > 3 else None
+        window = handle[0] if isinstance(handle, tuple) else handle
+        try:
+            if controller is not None:
+                controller.close()
+        except Exception:
+            pass
+        try:
+            if hasattr(window, "close"):
+                window.close()
+        except Exception:
+            pass
+
     def on_quit(self, _sender=None):
         # Never leave an orphaned worker holding the camera after Quit.
+        self._close_preview()
         if self.supervisor.is_worker_running():
             self.supervisor.stop_worker()
         self._quit_hook()

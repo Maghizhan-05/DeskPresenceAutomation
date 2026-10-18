@@ -62,8 +62,14 @@ class Detector:
         self.close()
 
     # -- the single sample ----------------------------------------------------
-    def sample(self):
-        """Grab one frame and return True iff a face is visible in it."""
+    def sample(self, publish_preview=False, preview_writer=None):
+        """Grab one frame and return True iff a face is visible in it.
+
+        `publish_preview` is opt-in and OFF by default. When enabled, the
+        already-in-memory frame is downscaled and copied into the caller's
+        fixed-size shared-memory slot AFTER inference, so the detection result
+        can never depend on whether preview is on. Nothing is written to disk.
+        """
         if self._capture is None:
             self.open()
         capture = self._capture
@@ -72,6 +78,7 @@ class Detector:
         ok, frame = capture.read()
         if not ok or frame is None:
             return False
+        gray = None
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.equalizeHist(gray)  # helps in low light
@@ -81,8 +88,34 @@ class Detector:
                 minNeighbors=5,
                 minSize=(60, 60),
             )
-            return len(faces) > 0
+            present = len(faces) > 0
+            # Inference is complete and `present` is already decided; nothing
+            # below can change it.
+            if publish_preview and preview_writer is not None:
+                self._publish(frame, faces, present, preview_writer)
+            return present
         finally:
             # Drop every pixel reference before returning. No persistence.
             del frame
             gray = None
+
+    @staticmethod
+    def _publish(frame, faces, present, writer):
+        """Copy a downscaled frame into the fixed shared slot. Best effort."""
+        try:
+            height, width = frame.shape[:2]
+            small = cv2.resize(
+                frame,
+                (config.PREVIEW_WIDTH, config.PREVIEW_HEIGHT),
+                interpolation=cv2.INTER_AREA,
+            )
+            box = (0, 0, 0, 0)
+            if len(faces) > 0:
+                fx, fy, fw, fh = faces[0]
+                sx = float(config.PREVIEW_WIDTH) / float(width)
+                sy = float(config.PREVIEW_HEIGHT) / float(height)
+                box = (int(fx * sx), int(fy * sy), int(fw * sx), int(fh * sy))
+            writer.write(small.tobytes(), present, box)
+        except Exception:
+            # A preview failure must never break detection or the loop.
+            pass

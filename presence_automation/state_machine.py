@@ -6,7 +6,12 @@ cooldown edge unit-testable without hardware.
 
     IDLE --(N consecutive positives)--> ARRIVING --> PRESENT
     PRESENT --(negative)--> LEAVING --(absence >= ABSENCE_SECONDS)--> COOLDOWN
+    LEAVING --(M consecutive positives)--> PRESENT
     COOLDOWN --(cooldown elapsed)--> IDLE
+
+The return path out of LEAVING is debounced symmetrically with arrival: a lone
+false-positive frame must not cancel an absence countdown that is already
+running, and it must not rewind the absence already accrued.
 """
 
 from enum import Enum
@@ -35,6 +40,7 @@ class PresenceStateMachine:
         arrival_samples=None,
         absence_seconds=None,
         cooldown_seconds=None,
+        return_samples=None,
     ):
         # Resolved at call time, not at def time: binding config values as
         # default arguments would freeze them at import and silently ignore
@@ -45,14 +51,20 @@ class PresenceStateMachine:
             absence_seconds = config.ABSENCE_SECONDS
         if cooldown_seconds is None:
             cooldown_seconds = config.COOLDOWN_SECONDS
+        if return_samples is None:
+            return_samples = config.RETURN_CONFIRM_SAMPLES
         if arrival_samples < 1:
             raise ValueError("arrival_samples must be >= 1")
+        if return_samples < 1:
+            raise ValueError("return_samples must be >= 1")
         self.arrival_samples = arrival_samples
         self.absence_seconds = absence_seconds
         self.cooldown_seconds = cooldown_seconds
+        self.return_samples = return_samples
 
         self.state = State.IDLE
         self._positive_streak = 0
+        self._return_streak = 0
         self._absence_since = None
         self._cooldown_until = None
 
@@ -61,10 +73,20 @@ class PresenceStateMachine:
     def positive_streak(self):
         return self._positive_streak
 
+    @property
+    def return_streak(self):
+        return self._return_streak
+
     def seconds_absent(self, now):
         if self._absence_since is None:
             return 0.0
         return now - self._absence_since
+
+    def absence_remaining(self, now):
+        """Seconds of continuous absence still required before DEPARTED."""
+        if self._absence_since is None:
+            return 0.0
+        return max(0.0, self.absence_seconds - self.seconds_absent(now))
 
     def cooldown_remaining(self, now):
         if self._cooldown_until is None:
@@ -111,14 +133,24 @@ class PresenceStateMachine:
                 return None
             self.state = State.LEAVING
             self._absence_since = now
+            self._return_streak = 0
             return None
 
         if self.state is State.LEAVING:
             if present_now:
-                # Came back before the absence window closed: nothing happened.
-                self.state = State.PRESENT
-                self._absence_since = None
+                # A positive sample does NOT cancel the countdown on its own:
+                # one false-positive frame used to reset the entire 30s timer,
+                # so sustained absence never accumulated. Require the same
+                # number of consecutive positives that arrival requires.
+                self._return_streak += 1
+                if self._return_streak >= self.return_samples:
+                    self.state = State.PRESENT
+                    self._absence_since = None
+                    self._return_streak = 0
                 return None
+            # Flicker broken. Absence keeps accruing from the ORIGINAL
+            # timestamp -- a stray frame must not rewind time already served.
+            self._return_streak = 0
             if self.seconds_absent(now) >= self.absence_seconds:
                 self.state = State.COOLDOWN
                 self._absence_since = None
@@ -132,5 +164,6 @@ class PresenceStateMachine:
     def _enter_present(self):
         self.state = State.PRESENT
         self._positive_streak = 0
+        self._return_streak = 0
         self._absence_since = None
         return Event.ARRIVED

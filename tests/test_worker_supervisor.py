@@ -435,6 +435,62 @@ class StateCorruptionAfterStartTests(SupervisorTestCase):
         self.assertEqual(ws.worker_status(), "Running (Present)")
 
 
+class PreviewRequestTests(SupervisorTestCase):
+    def setUp(self):
+        SupervisorTestCase.setUp(self)
+        self._orig_preview = config.PREVIEW_REQUEST_FILE
+        config.PREVIEW_REQUEST_FILE = os.path.join(self.tmp, "preview.json")
+
+    def tearDown(self):
+        config.PREVIEW_REQUEST_FILE = self._orig_preview
+        SupervisorTestCase.tearDown(self)
+
+    def test_preview_is_off_by_default(self):
+        self.assertFalse(ws.preview_requested())
+        self.assertFalse(config.PREVIEW_ENABLED_DEFAULT)
+
+    def test_set_and_read_preview_request(self):
+        ws.set_preview_requested(True)
+        self.assertTrue(ws.preview_requested())
+        ws.set_preview_requested(False)
+        self.assertFalse(ws.preview_requested())
+
+    def test_corrupt_preview_file_falls_back_to_default_off(self):
+        with open(ws._preview_path(), "w") as handle:
+            handle.write("{not json")
+        self.assertFalse(ws.preview_requested())
+
+    def test_non_dict_preview_file_falls_back_to_default_off(self):
+        ws._atomic_write(ws._preview_path(), ["garbage"])
+        self.assertFalse(ws.preview_requested())
+
+    def test_stop_worker_clears_the_preview_request(self):
+        ws.start_worker()
+        ws.set_preview_requested(True)
+        self.assertTrue(ws.preview_requested())
+        ws.stop_worker(timeout=1.0)
+        self.assertFalse(ws.preview_requested())
+
+    def test_stop_worker_unlinks_the_preview_segment(self):
+        from presence_automation import preview_buffer
+
+        name = "deskpresence_stoptest_%d" % os.getpid()
+        original = config.PREVIEW_SHM_NAME
+        config.PREVIEW_SHM_NAME = name
+        try:
+            writer = preview_buffer.PreviewWriter(name)
+            writer.write(bytes(preview_buffer.frame_bytes()), True)
+            # Orphan it: the writer handle is dropped without close().
+            writer.closed = True
+            ws.start_worker()
+            ws.stop_worker(timeout=1.0)
+            with self.assertRaises(preview_buffer.PreviewUnavailable):
+                preview_buffer.PreviewReader(name)
+        finally:
+            config.PREVIEW_SHM_NAME = original
+            preview_buffer.unlink_stale(name)
+
+
 class StatusTests(SupervisorTestCase):
     def _age_out_startup_grace(self):
         """Pretend the worker started long ago, so startup grace no longer applies."""

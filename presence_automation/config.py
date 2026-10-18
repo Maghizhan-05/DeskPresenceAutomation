@@ -8,6 +8,11 @@ SAMPLE_INTERVAL_SECONDS = 1.0
 # Arrival requires this many *consecutive* positive samples (~3s at 1 fps),
 # so a single glance / passer-by cannot trigger a launch.
 ARRIVAL_CONSECUTIVE_SAMPLES = 3
+# Mirror of ARRIVAL_CONSECUTIVE_SAMPLES on the RETURN path: while an absence
+# countdown is running, this many CONSECUTIVE positive samples are required to
+# cancel it. Without this, one false-positive frame (clutter, a photo, a
+# reflection) resets the whole 30s timer and departure never fires.
+RETURN_CONFIRM_SAMPLES = 3
 
 # Continuous absence required before we consider the desk vacated.
 ABSENCE_SECONDS = 30.0
@@ -47,3 +52,16 @@ WORKER_STARTUP_GRACE_SECONDS = 15.0
 WORKER_STOP_GRACE_SECONDS = 5.0
 # LaunchAgent label for the menu-bar UI (distinct from the headless agent).
 MENUBAR_LAUNCHD_LABEL = "com.user.deskpresence.menubar"
+
+# --- camera preview (opt-in, in-memory only) ---------------------------------
+# OFF by default. When enabled, the worker copies the already-in-memory frame
+# (AFTER inference, so detection never depends on preview being on) into a
+# fixed-size shared-memory segment that is overwritten in place every tick.
+# Never appended, never written to disk, never encoded, never transmitted.
+PREVIEW_ENABLED_DEFAULT = False
+PREVIEW_SHM_NAME = "deskpresence_preview"
+PREVIEW_WIDTH = 320
+PREVIEW_HEIGHT = 240
+PREVIEW_CHANNELS = 3
+# Toggle file: the menu asks for preview, the worker picks it up next tick.
+PREVIEW_REQUEST_FILE = STATE_DIR + "/preview.json"
