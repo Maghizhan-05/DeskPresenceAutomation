@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Desk Presence Automation LaunchAgent.
+
+  Install:
+    cp launchd/com.user.deskpresence.plist ~/Library/LaunchAgents/
+    # edit the two absolute paths below to match your checkout, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.deskpresence.plist
+
+  Camera permission: launchd-spawned processes get their own TCC entry. The
+  first run triggers the macOS camera prompt for the Python binary below; the
+  justification string presented to the user is NSCameraUsageDescription.
+  If no prompt appears, grant it manually in
+  System Settings > Privacy & Security > Camera.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.deskpresence</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/maghizhan/Developments/DeskPresenceAutomation/.venv/bin/python</string>
+        <string>-m</string>
+        <string>presence_automation.main</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/maghizhan/Developments/DeskPresenceAutomation</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/maghizhan/.local/state/deskpresence/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/maghizhan/.local/state/deskpresence/launchd.err.log</string>
+
+    <!-- Justification shown in the macOS camera-access prompt. -->
+    <key>NSCameraUsageDescription</key>
+    <string>Desk Presence Automation samples the webcam about once per second to tell whether you are at your desk. Frames are analysed in memory and discarded immediately; no images are stored, recorded, or transmitted.</string>
+</dict>
+</plist>

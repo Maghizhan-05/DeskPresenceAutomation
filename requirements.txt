@@ -1,0 +1,5 @@
+# Haar cascades (cv2.CascadeClassifier + cv2.data.haarcascades) were REMOVED in
+# OpenCV 5.0 — the 5.x wheel ships only FaceDetectorYN, which needs an external
+# ONNX model download. Pinned to 4.x so detection stays fully offline.
+opencv-python>=4.9,<5
+pyobjc-framework-Cocoa>=10.0
