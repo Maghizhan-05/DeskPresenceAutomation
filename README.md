@@ -1,326 +1,107 @@
-# Desk Presence Automation
+# Desk Presence Automation — macOS guide
 
-Samples the webcam about once per second; when you sit down it opens your work
-apps and starts your music, and when you leave for 30+ seconds it pauses the
-music and quits **only** the apps it opened itself. A menu-bar icon turns the
-whole thing on and off, so the camera is used only while you have it enabled.
+Sit down, and this app can open ChatGPT and Claude and play a Spotify album. Leave the camera's view for about **30 seconds**, and it pauses Spotify and closes **only the app instances the automation opened**. You control it from the **DP** menu-bar item; **Disable Automation** stops the camera worker.
 
-Detection is fully on-device. A frame is analysed in memory and dropped
-immediately — no image is ever written to disk, encoded, or transmitted. The
-only things persisted are a state-transition log, a session file recording which
-apps the automation launched, and a small status heartbeat.
+**Mac only.** This version uses Apple Vision, macOS menu-bar APIs, LaunchAgent, and AppleScript. It does **not** run on Windows. There is no Windows installer or equivalent in this repository yet.
 
-## Install
+> **Already see DP in the menu bar?** This Mac is already installed. Skip the installation steps and go straight to [Daily use](#daily-use). Do not start a second copy of the menu-bar app.
 
-```bash
-cd ~/Developments/DeskPresenceAutomation
-python3 -m venv .venv
-./.venv/bin/pip install -r requirements.txt
-```
+## Before you install on another Mac
 
-> `opencv-python` is pinned to `<5` on purpose: OpenCV 5.0 removed
-> `cv2.CascadeClassifier` and `cv2.data.haarcascades`, leaving only YuNet,
-> which requires downloading an external ONNX model. The 4.x pin keeps
-> detection offline with zero extra assets.
+- A Mac with a working webcam and `python3` (including `venv` and `pip`). This project has been exercised with Python 3.9 on macOS; other combinations have not been validated here.
+- The native ChatGPT and Claude apps, plus Spotify signed in and able to play music. The configured bundle IDs were verified for the installations on the original Mac; check [Troubleshooting](#troubleshooting) if your copies differ.
+- A local copy of this **entire project folder** from its owner. It contains `requirements.txt`, `presence_automation/`, and `launchd/`. No public download link or packaged installer is provided here.
+- Permission to install Python packages and a LaunchAgent in **your own user account**. No administrator installation is specified.
 
-## Menu bar (recommended)
+Keep the project folder in its final location after installation: the LaunchAgent uses absolute paths to it.
 
-Install the menu-bar LaunchAgent so the icon appears at login:
+## Install once
 
-```bash
-mkdir -p ~/.local/state/deskpresence ~/Library/LaunchAgents
-cp launchd/com.user.deskpresence.menubar.plist ~/Library/LaunchAgents/
-# edit the absolute paths inside if your checkout differs, then:
-launchctl bootstrap gui/$(id -u) \
-  ~/Library/LaunchAgents/com.user.deskpresence.menubar.plist
-```
+1. Open **Terminal** and enter the project folder. An easy way is to type `cd ` (with a space), drag the folder from Finder into Terminal, then press Return. Confirm `requirements.txt` and `launchd/` are in that folder.
+2. Create the project's virtual environment and install dependencies:
 
-To try it immediately without logging out:
+   ```bash
+   python3 -m venv .venv
+   ./.venv/bin/python -m pip install -r requirements.txt
+   ```
 
-```bash
-./.venv/bin/python -m presence_automation.menubar
-```
+   This installs OpenCV, the Apple Vision bridge, and the menu-bar library into this folder's `.venv`; it does not install a camera model or upload frames.
 
-A **DP** item appears in the menu bar. Clicking it shows:
+3. Still inside the project folder, copy and tailor the menu-bar LaunchAgent for **your** home directory and the folder's actual path. Paste this whole block:
 
-| Menu item | What it does |
+   ```bash
+   export APP_DIR="$PWD"
+   python3 - <<'PY'
+   import os
+   import plistlib
+   import subprocess
+   from pathlib import Path
+
+   root = Path(os.environ["APP_DIR"]).resolve()
+   source = root / "launchd" / "com.user.deskpresence.menubar.plist"
+   agent_dir = Path.home() / "Library" / "LaunchAgents"
+   state_dir = Path.home() / ".local" / "state" / "deskpresence"
+   agent_dir.mkdir(parents=True, exist_ok=True)
+   state_dir.mkdir(parents=True, exist_ok=True)
+   agent = plistlib.loads(subprocess.check_output(
+       ["plutil", "-convert", "binary1", "-o", "-", str(source)]
+   ))
+   agent["ProgramArguments"][0] = str(root / ".venv" / "bin" / "python")
+   agent["WorkingDirectory"] = str(root)
+   agent["StandardOutPath"] = str(state_dir / "menubar.out.log")
+   agent["StandardErrorPath"] = str(state_dir / "menubar.err.log")
+   target = agent_dir / "com.user.deskpresence.menubar.plist"
+   with target.open("wb") as stream:
+       plistlib.dump(agent, stream)
+   print("Installed LaunchAgent:", target)
+   PY
+   plutil -lint "$HOME/Library/LaunchAgents/com.user.deskpresence.menubar.plist"
+   launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.deskpresence.menubar.plist"
+   ```
+
+   `plutil` should report **OK**. The **DP off** menu-bar item should appear. Run `bootstrap` **only once** for a new install; if the service is already loaded, use the existing DP item instead of creating another process.
+
+4. Click **DP off → Enable Automation**. Allow macOS **Camera** permission for the Python worker when prompted. Allow **Apple Events/Automation** permissions when prompted to control the other apps and Spotify. If you denied either, see [Troubleshooting](#troubleshooting).
+5. To start the menu automatically at the next login, open **DP** and look at **Launch at Login**. If it already has a ✓, leave it alone; otherwise click it once to check it. This is separate from **Enable Automation**: the first controls whether the *menu* appears at login; the second controls whether the *camera worker* runs. The menu remembers the automation's last enabled/disabled setting.
+
+## Daily use
+
+| What to do | What you should see |
 | --- | --- |
-| `Status: …` | `Stopped`, `Starting…`, `Running (Present)`, `Running (Away)`, or `Unresponsive`. Not clickable. |
-| `Enable Automation` / `Disable Automation` | Starts or stops the background worker. A checkmark shows it is running. |
-| `Show Camera Preview` | Opens a small window showing what the camera sees plus the live absence countdown. Off by default; see below. |
-| `Launch at Login` | Checkmark = the menu-bar app starts automatically at login. |
-| `Quit` | Exits the menu-bar app, stopping the worker first so nothing is left using the camera. |
+| Click **DP → Enable Automation** | `DP ...` while starting, then `DP on` and `Status: Running (Present)` or `Running (Away)`. The worker uses the webcam at roughly one sample per second. |
+| Sit where the webcam sees your face | After three consecutive positive samples, the automation opens ChatGPT/Claude **if not already open**, and requests playback of its configured Spotify album. |
+| Leave the camera's view | The preview shows `Away - closing apps in Ns` if open. After roughly 30 seconds of confirmed absence, Spotify is paused and only automation-launched ChatGPT/Claude instances are asked to quit. There is a 60-second cooldown before another arrival can launch apps. |
+| Click **DP → Show Camera Preview** | An optional local live window with a face box and countdown. Close with its red button or click the menu item again; the worker keeps running. Preview is **off by default**. |
+| Click **DP → Disable Automation** | `DP off` / `Status: Stopped`. The worker exits, which releases its camera access; the menu remains available. Disabling does **not** retroactively close apps. |
+| Click **DP → Quit** | Closes the preview, stops the worker, and exits the menu app. |
 
-The menu-bar title mirrors the state at a glance: `DP off`, `DP ...`, `DP on`,
-`DP ?`.
+**Privacy:** Face detection runs locally with Apple's Vision framework. Camera frames are processed in memory, not saved as images or sent by this app. With preview on, exactly one downscaled frame occupies a fixed-size shared-memory slot, overwritten in place; turning preview off destroys it. The preview appears **on your screen**, so screen-sharing or recording software could capture it. Spotify uses its normal service for music playback; the webcam feed is not sent to Spotify.
 
-### Turning the camera off
+**Detection is not infallible.** Vision uses a confidence threshold of `0.7`; three consecutive face-positive samples are required to cancel an absence countdown. A stray positive does not reset time already accrued. Test both a seated and an empty-desk period if you tune the threshold; raising it can miss real faces. A detected face does not identify *who* it belongs to.
 
-**Disable Automation** terminates the worker process (SIGTERM, escalating to
-SIGKILL after 5s). The camera device is reclaimed by macOS when that process
-exits. Note the honest limit of this guarantee: the app verifies the *worker
-process has exited*, which is what releases the device — it does not query the
-camera hardware's state directly.
+## Troubleshooting
 
-While the automation is disabled, no worker process or camera client of this
-project is running and the camera is untouched. The menu-bar process itself
-stays alive (that is how the menu stays available) but it **never opens the
-camera** — only the worker does — so there is exactly one camera permission to
-approve, not two.
+| Symptom | Check and fix |
+| --- | --- |
+| **No DP menu item after installation** | Check that `plutil -lint` returned `OK`, then run `launchctl print "gui/$(id -u)/com.user.deskpresence.menubar"`. Check `~/.local/state/deskpresence/menubar.err.log`. Ensure the project folder has not moved since installation. Do **not** run `./.venv/bin/python -m presence_automation.menubar` as a second copy while the LaunchAgent is loaded. |
+| **`bootstrap` says the service is already loaded** | This is an existing installation, not a request to start a second copy. Use the DP menu. |
+| **`DP ?` / `Status: Unresponsive`** | The worker or its heartbeat is unavailable or stale. Check `~/.local/state/deskpresence/deskpresence.log`; then choose **Disable Automation**, confirm `DP off`, and choose **Enable Automation** again. If it persists, check camera permission and other apps using the webcam. |
+| **`cannot open camera index 0` or no detections** | Go to **System Settings → Privacy & Security → Camera** and permit the Python worker. Check that the webcam works elsewhere and is not exclusively occupied. To run a three-sample camera check, first **Disable Automation**, then run `./.venv/bin/python -m presence_automation.main --self-test` from the project folder. It reports booleans and Vision confidence scores, not images. |
+| **Apps or music do not open** | Allow the Automation/Apple Events prompts. Make sure the native apps are installed and Spotify is signed in. On this Mac the configured IDs are `com.openai.codex`, `com.anthropic.claudefordesktop`, and `com.spotify.client`; another app build may differ. From Terminal, check `osascript -e 'id of app "ChatGPT"'` (and similarly `Claude`/`Spotify`) and edit `TRACKED_BUNDLE_IDS` or `SPOTIFY_BUNDLE_ID` in `presence_automation/config.py` only if necessary. The Spotify album link is configured there as `SPOTIFY_URI`. |
+| **A face is missed, or an empty desk is treated as occupied** | With the worker disabled, run the self-test above while seated and while the desk is empty. Adjust `FACE_CONFIDENCE_THRESHOLD` in `presence_automation/config.py` cautiously: lower for missed faces, higher for false detections. Re-enable the worker to load a changed value. The legacy `DETECTOR_BACKEND = "haar"` option is available, but it was noisier on the tested desk. |
+| **Countdown does not reach zero** | Keep the camera aimed at the empty desk for over 30 seconds. If three consecutive false face detections occur, the countdown can still cancel; check the optional preview and detection confidence using the self-test. Report the log's `present -> leaving`, `leaving -> present`, and `DEPARTED` lines to the maintainer (no images are needed). |
 
-### Camera preview (opt-in)
+## Settings and diagnostics
 
-**Show Camera Preview** opens a small window with the live camera image, a box
-around a detected face, and a status line such as
-`Away - closing apps in 18s`. It is **off by default** and must be turned on
-explicitly each time; closing the window — with the menu item or the window's
-own red close button — stops the preview but never stops the automation.
+All settings are in `presence_automation/config.py`. Key defaults: `DETECTOR_BACKEND = "vision"`, `FACE_CONFIDENCE_THRESHOLD = 0.7`, `ARRIVAL_CONSECUTIVE_SAMPLES = 3`, `RETURN_CONFIRM_SAMPLES = 3`, `ABSENCE_SECONDS = 30.0`, `COOLDOWN_SECONDS = 60.0`, and `SAMPLE_INTERVAL_SECONDS = 1.0`. Changes take effect when the **worker is restarted** (Disable, then Enable). Do not run a separate headless worker alongside the DP menu's worker.
 
-How it stays private:
-
-* The worker copies a downscaled (320×240) frame into a **fixed-size** block of
-  shared memory, overwritten in place every tick. It never grows, never
-  appends, and holds exactly one frame.
-* Nothing is written to disk, encoded to an image file, or sent anywhere. The
-  menu-bar process maps that same block read-only and blits it to the screen.
-* The block is destroyed when the preview is switched off, when the worker
-  stops, and when the app quits. A segment left by a crashed worker is unlinked
-  and recreated rather than reused, so no frame outlives the worker.
-* The request is a **lease** bound to the requesting menu's PID and process
-  start time, re-stamped while the window is open. If the menu crashes, the
-  lease expires within `PREVIEW_LEASE_SECONDS` (10s) and the worker stops
-  publishing — a dead UI can never leave frames flowing. A recycled PID fails
-  the start-time check and is likewise refused.
-* Turning preview on does not change detection: the frame is published **after**
-  inference, so the presence result is identical either way.
-
-**The honest privacy trade-off:** with preview off, no image of you exists
-anywhere outside the worker's momentary memory — it cannot be screenshotted or
-screen-shared because nothing is ever drawn. Turning preview on renders your
-camera feed to your own screen, which means screen-recording or screen-sharing
-software could now capture it. It is still never saved or transmitted by this
-app, but the on-screen window is a new (small, local, opt-in) surface that did
-not exist before.
-
-### How the 30-second departure works
-
-Arrival needs 3 consecutive positive samples, and the return path is debounced
-the same way: once the absence countdown is running, **3 consecutive positive
-samples** are needed to cancel it. A single false-positive frame — background
-clutter, a photo, a reflection — no longer resets the timer, and it does not
-rewind absence already accrued. Without this, a lone stray detection reset the
-whole 30s window and departure never fired.
-
-### Face detector accuracy
-
-The default backend is Apple's **Vision** (`VNDetectFaceRectanglesRequest`) using
-its bundled on-device model; no model file is downloaded and no frame is saved
-or sent to a service. The OpenCV camera supplies the same upright, unmirrored
-pixels to Vision and the preview. Vision's normalized, lower-left face box is
-converted to the preview's top-left pixel coordinates. Only observations at or
-above `FACE_CONFIDENCE_THRESHOLD` count as present; the existing 3-sample
-arrival/return confirmation and 30-second absence logic remain unchanged.
-
-`FACE_CONFIDENCE_THRESHOLD = 0.7` is a starting point, **not a guarantee of
-perfect classification**. If seated faces are consistently missed, lower it
-slightly; if an empty desk is recognized as occupied, increase it slightly.
-Always validate *both* seated and empty-desk periods after adjusting it: a
-higher threshold reduces false positives at the cost of missed real faces.
-To select the legacy offline cascade on an unsupported machine, set
-`DETECTOR_BACKEND = "haar"` in `config.py`; the Vision dependency can then be
-absent. `--self-test` reports per-sample Vision confidence values without
-logging frames, so you can check the signal before enabling automation.
-
-### Launch at Login
-
-The toggle uses `launchctl enable|disable`, deliberately **not**
-`bootout`/`bootstrap`: booting out the agent would kill the very menu-bar
-process hosting the menu. The state shown is re-read from
-`launchctl print-disabled` after every change, so the checkmark reflects what
-launchd actually recorded rather than what the command returned.
-
-## Grant camera permission
-
-The first run triggers the macOS camera prompt for the Python binary. If you
-see `cannot open camera index 0`:
-
-1. **System Settings → Privacy & Security → Camera**
-2. Enable the entry for your Python interpreter (or for `launchd`-spawned
-   `python` after installing the LaunchAgent).
-3. Re-run — a terminal that was denied once needs the toggle flipped manually.
-
-Apple Events permission is also required to quit apps and control Spotify; the
-first `osascript` call prompts for it. All AppleScript calls are timeout-guarded,
-so a pending prompt slows a transition but never crashes the loop.
-
-Verify everything with the hardware/app probe:
+For a non-camera diagnostics check, run:
 
 ```bash
-./.venv/bin/python -m presence_automation.main --self-test --verbose
+launchctl print "gui/$(id -u)/com.user.deskpresence.menubar"
+./.venv/bin/python -m unittest discover -s . -p 'test_*.py'
 ```
 
-Expected output: each tracked app's running state, the session file contents,
-three `camera sample N: present=... confidence=(...)` lines, and
-`camera ok, 3 samples -> [...]`.
+The project currently has **217 automated tests**. The logs at `~/.local/state/deskpresence/` contain timestamps, app identities, status and transitions—not image files. A heartbeat also reports `detector_backend` (`vision` or `haar`) for live verification. When enabled, use **DP → Disable Automation** to stop the worker; a test command is not an on/off switch.
 
-## Advanced: headless mode (no menu bar)
-
-The original terminal-only path still works and is unchanged:
-
-```bash
-./.venv/bin/python -m presence_automation.main --verbose
-# bounded manual test:
-./.venv/bin/python -m presence_automation.main --max-ticks 60 --verbose
-```
-
-Run it at login without any UI:
-
-```bash
-cp launchd/com.user.deskpresence.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.deskpresence.plist
-# stop (this is the only way to disable the headless agent):
-launchctl bootout gui/$(id -u)/com.user.deskpresence
-```
-
-Use either the menu-bar agent or the headless agent — not both, or two workers
-will compete for the camera.
-
-Logs: `~/.local/state/deskpresence/deskpresence.log`, plus `menubar.out.log` /
-`menubar.err.log` or `launchd.out.log` / `launchd.err.log`.
-
-## Configuration
-
-Everything tunable lives in `presence_automation/config.py`:
-
-| Constant | Default | Meaning |
-| --- | --- | --- |
-| `DETECTOR_BACKEND` | `"vision"` | Apple on-device Vision; `"haar"` remains an offline fallback |
-| `FACE_CONFIDENCE_THRESHOLD` | `0.7` | minimum Vision face score; tune after testing occupied AND empty desk |
-| `ARRIVAL_CONSECUTIVE_SAMPLES` | `3` | consecutive positive frames before "arrived" fires |
-| `ABSENCE_SECONDS` | `30.0` | continuous absence before "departed" fires |
-| `COOLDOWN_SECONDS` | `60.0` | post-departure window where re-launch is blocked |
-| `SAMPLE_INTERVAL_SECONDS` | `1.0` | seconds between webcam samples |
-| `CAMERA_INDEX` | `0` | which camera to use |
-| `TRACKED_BUNDLE_IDS` | ChatGPT, Claude | apps launched on arrival |
-| `SPOTIFY_URI` | `spotify:album:1uwOU5ZjczJJozQkhzrGJr` | what to play on arrival |
-| `HEARTBEAT_STALE_SECONDS` | `5.0` | heartbeat age after which status reads `Unresponsive` |
-| `WORKER_STARTUP_GRACE_SECONDS` | `15.0` | window where a heartbeat-less worker shows `Starting…` |
-| `WORKER_STOP_GRACE_SECONDS` | `5.0` | SIGTERM grace before SIGKILL on Disable |
-
-**Change the music:** copy a Spotify link, take the ID out of it, and set
-`SPOTIFY_URI` to `spotify:album:<id>`, `spotify:playlist:<id>`, or
-`spotify:track:<id>`.
-
-**Change the apps:** add bundle IDs to `TRACKED_BUNDLE_IDS`. Find one with:
-
-```bash
-osascript -e 'id of app "AppName"'
-```
-
-Bundle IDs verified on this machine: ChatGPT.app is `com.openai.codex` (not
-`com.openai.chat`) and Claude.app is `com.anthropic.claudefordesktop`.
-
-## How the "don't touch my apps" guard works
-
-Ownership is per **process instance**, not per bundle ID.
-
-1. `launch_tracked()` skips any app that already has a running PID — that is the
-   user's instance, and it is never recorded.
-2. For an app it does start, it waits for a PID that was not running before the
-   launch and records *that exact PID*. If the launch fails or no new PID ever
-   appears, nothing is claimed.
-3. `close_tracked()` terminates only a recorded `(bundle_id, pid)` pair that is
-   still alive and still owned by that bundle. If our instance exited and the
-   user later opened the app, the replacement has a different PID, so the record
-   is silently discarded and the user's app is left alone. A PID recycled by a
-   different app is likewise never touched.
-
-Spotify follows the same rule, and on departure the automation only *pauses*
-playback — it quits Spotify only if it cold-started it itself.
-
-The worker the menu bar supervises is tracked the same way: `{pid, start_time}`
-is persisted, so after the menu-bar app restarts it recognises its own worker as
-a non-child process, and a recycled PID (later start time) is never signalled.
-
-## Status reporting
-
-The worker rewrites `~/.local/state/deskpresence/heartbeat.json` atomically once
-per tick with `{state, present, pid, start_time, ts}` plus countdowns and
-`detector_backend` (`vision` or `haar`, for live verification). The menu reads only that
-file, so it never presents stale presence as live: a heartbeat older than
-`HEARTBEAT_STALE_SECONDS`, one whose `pid`/`start_time` do not both match the
-tracked worker exactly, a heartbeat missing either identity field, or a corrupt
-file all render as `Unresponsive`. `Starting…` is reserved for the single case
-where the worker has not written a heartbeat file *at all* yet (within
-`WORKER_STARTUP_GRACE_SECONDS`); a heartbeat that exists but fails validation is
-always `Unresponsive`, never "still starting".
-
-Ownership of a worker this process spawned is additionally held in memory
-(`pid` + `start_time`), independent of the persisted file. A corrupted or
-deleted `menubar.json` therefore cannot orphan a running worker: Disable
-terminates that child through its own process handle and reports success only
-once the process is confirmed exited.
-
-## Tests
-
-```bash
-./.venv/bin/python -m unittest discover -s . -p "test_*.py" -v   # 217 tests, no camera hardware
-```
-
-- `tests/test_state_machine.py` (34) — the state machine is pure (no camera, no
-  subprocess, no clock reads; the caller passes each sample plus its timestamp),
-  so every debounce, absence, and cooldown edge is deterministic. Includes the
-  return-debounce regressions: a stray positive cannot cancel or rewind an
-  absence countdown, and a replay of the real logged flicker pattern must reach
-  `DEPARTED`.
-- `tests/test_app_manager.py` (15) — PID ownership against a fake process table:
-  user-opened replacements, PID reuse, failed launches, failed quits, legacy
-  records, mixed ownership.
-- `tests/test_spotify_control.py` (9) — ownership is never claimed (or is rolled
-  back) when `open location` fails or Spotify never appears.
-- `tests/test_worker_supervisor.py` (75) — worker identity across restarts with
-  fail-closed schema validation (invalid PID, missing/empty `start_time`,
-  non-dict or corrupt state), direct `Popen` termination of our own child even
-  when persisted state is corrupted, SIGTERM→SIGKILL escalation, heartbeat
-  freshness and full-identity matching, preview request/segment cleanup on stop,
-  and `launchctl enable|disable` login-item handling (asserting `bootout` is
-  never used).
-- `tests/test_menubar.py` (33) — menu structure, label/checkmark rendering for
-  every status, and action wiring, with no GUI event loop; preview open/close
-  never starts or stops the worker.
-- `tests/test_detector.py` (11) — Vision confidence gate, normalized lower-left
-  to unmirrored top-left preview conversion, malformed observation handling,
-  real in-memory Vision bridge without camera, backend selection, and
-  per-sample confidence diagnostics.
-- `tests/test_preview.py` (40) — shared-memory lifecycle (fixed size across 200
-  writes, overwrite-in-place, unlink on close, stale segment from a crashed
-  worker is replaced), ownership-aware tracker registration with an asserted
-  **clean stderr** subprocess run, face-box validation/clamping and proof the
-  rectangle is burned into the displayed copy without mutating the source,
-  the preview-off default touching no buffer, identical detection results with
-  preview on and off, and countdown text rendering.
-
-## Layout
-
-```
-presence_automation/
-  config.py             constants only, no I/O
-  state_machine.py      pure IDLE/ARRIVING/PRESENT/LEAVING/COOLDOWN machine
-  detector.py           one webcam frame -> bool, Vision by default; Haar fallback
-  app_manager.py        launch/quit with per-PID ownership
-  spotify_control.py    spotify: URI playback + pause
-  main.py               loop; side effects on transition edges only
-  worker_supervisor.py  worker process lifecycle + login item + heartbeat
-  menubar.py            rumps status item; no camera, no process logic
-  preview_buffer.py     fixed-size shared-memory slot, one frame, in place
-  preview_window.py     opt-in preview window + countdown text
-tests/test_state_machine.py
-tests/test_detector.py
-tests/test_app_manager.py
-tests/test_spotify_control.py
-tests/test_worker_supervisor.py
-tests/test_menubar.py
-tests/test_preview.py
-launchd/com.user.deskpresence.menubar.plist   menu bar (recommended)
-launchd/com.user.deskpresence.plist           headless (advanced)
-```
+To stop launching the menu at login, uncheck **DP → Launch at Login**. You can still use the current menu until you Quit. To remove the installed menu agent entirely, **Disable Automation** and **Quit** first, then remove its LaunchAgent; do not delete the project folder while an installed agent still points to it.
